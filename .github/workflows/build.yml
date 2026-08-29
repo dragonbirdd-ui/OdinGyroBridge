@@ -10,7 +10,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout OdinGyroBridge
         uses: actions/checkout@v4
 
       - name: Setup .NET 8
@@ -18,10 +18,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Restore
-        run: dotnet restore OdinPortalDsuDs4Bridge.csproj
-
-      - name: Publish Windows x64 single-file EXE
+      - name: Build OdinGyroBridge
         run: >
           dotnet publish OdinPortalDsuDs4Bridge.csproj
           -c Release
@@ -31,13 +28,40 @@ jobs:
           -p:PublishTrimmed=false
           -o publish
 
-      - name: Show output
-        shell: pwsh
-        run: Get-ChildItem -Recurse publish
+      - name: Clone ViGEmClient
+        run: git clone --recursive https://github.com/nefarius/ViGEmClient.git ViGEmClient-src
 
-      - name: Upload EXE artifact
+      - name: Build ViGEmClient x64 DLL
+        shell: cmd
+        run: |
+          msbuild ViGEmClient-src\ViGEmClient.sln /p:Configuration=Release_DLL /p:Platform=x64
+
+      - name: Find and copy ViGEmClient.dll
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path "ViGEmClient-src" -Filter "ViGEmClient.dll" -Recurse | Select-Object -First 1
+          if (-not $dll) {
+            throw "ViGEmClient.dll was not produced!"
+          }
+          Write-Host "Found DLL:" $dll.FullName
+          Copy-Item $dll.FullName "publish\ViGEmClient.dll"
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          Get-ChildItem publish
+          if (!(Test-Path "publish\OdinGyroBridge.exe")) {
+            throw "OdinGyroBridge.exe missing!"
+          }
+          if (!(Test-Path "publish\ViGEmClient.dll")) {
+            throw "ViGEmClient.dll missing!"
+          }
+
+      - name: Upload OdinGyroBridge package
         uses: actions/upload-artifact@v4
         with:
           name: OdinGyroBridge-Windows-x64
-          path: publish/OdinGyroBridge.exe
+          path: |
+            publish/OdinGyroBridge.exe
+            publish/ViGEmClient.dll
           if-no-files-found: error
