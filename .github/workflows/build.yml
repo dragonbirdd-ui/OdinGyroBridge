@@ -31,6 +31,9 @@ jobs:
       - name: Clone ViGEmClient
         run: git clone --recursive https://github.com/nefarius/ViGEmClient.git ViGEmClient-src
 
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
       - name: Build ViGEmClient x64 DLL
         shell: cmd
         run: |
