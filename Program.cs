@@ -18,20 +18,22 @@ class Program
     static readonly uint ClientId =
         (uint)Random.Shared.Next(1, int.MaxValue);
 
-    static UdpClient udp = new UdpClient();
+    static readonly UdpClient udp = new UdpClient();
     static IPEndPoint portal = null!;
 
     static void Main(string[] args)
     {
-        Console.WriteLine("===========================================");
-        Console.WriteLine(" Odin 2 Portal DSU Motion Detector v7");
-        Console.WriteLine("===========================================");
+        Console.WriteLine("==============================================");
+        Console.WriteLine(" Odin 2 Portal DSU Motion Detector v7.1 FIXED");
+        Console.WriteLine("==============================================");
         Console.WriteLine();
 
         string ip;
 
         if (args.Length > 0)
+        {
             ip = args[0];
+        }
         else
         {
             Console.Write("Portal IP (e.g. 192.168.1.108): ");
@@ -43,93 +45,113 @@ class Program
             portal = new IPEndPoint(
                 IPAddress.Parse(ip.Trim()), Port);
 
+            // CRITICAL FIX:
+            // Do not allow Receive() to block forever.
+            udp.Client.ReceiveTimeout = 200;
+
             Console.WriteLine();
             Console.WriteLine($"Portal DSU: {portal.Address}:{Port}");
             Console.WriteLine();
 
-            // Start DSU connection
-            Send(MsgVersion, new byte[] { 0xE9, 0x03 });
+            SendInitialRequests();
 
-            Send(
-                MsgPorts,
-                new byte[]
-                {
-                    0x01,
-                    0x00,
-                    0x00,
-                    0x00,
-                    0x00
-                });
+            Console.WriteLine("Waiting for first DSU packet...");
 
-            Send(MsgPad, new byte[8]);
+            byte[] first = WaitForFirstPacket();
 
-            Console.WriteLine("Waiting for DSU packets...");
             Console.WriteLine();
-
-            // Make sure packets are actually arriving.
-            byte[] first = ReceivePadPacket();
-
             Console.WriteLine(
                 $"DSU packet received. Length = {first.Length} bytes");
-
             Console.WriteLine();
-            Console.WriteLine("===========================================");
+
+            // ============================================
+            // PHASE 1
+            // ============================================
+
+            Console.WriteLine("==============================================");
             Console.WriteLine(" PHASE 1 - KEEP ODIN COMPLETELY STILL");
-            Console.WriteLine("===========================================");
+            Console.WriteLine("==============================================");
             Console.WriteLine();
-            Console.WriteLine(
-                "Put the Odin on a table and DO NOT TOUCH IT.");
-            Console.WriteLine();
-            Console.WriteLine("Starting in 3 seconds...");
-
-            Thread.Sleep(3000);
-
-            Console.WriteLine();
-            Console.WriteLine("Recording STILL data for 5 seconds...");
-            Console.WriteLine();
-
-            var stillPackets = Capture(5000);
-
-            Console.WriteLine(
-                $"Captured {stillPackets.Count} STILL packets.");
-
-            Console.WriteLine();
-            Console.WriteLine("===========================================");
-            Console.WriteLine(" PHASE 2 - MOVE / ROTATE ODIN STRONGLY");
-            Console.WriteLine("===========================================");
-            Console.WriteLine();
-            Console.WriteLine(
-                "Pick up the Odin NOW.");
-            Console.WriteLine(
-                "Rotate LEFT/RIGHT, UP/DOWN and tilt it.");
+            Console.WriteLine("Put Odin on a table.");
+            Console.WriteLine("DO NOT TOUCH OR MOVE IT.");
             Console.WriteLine();
             Console.WriteLine("Starting in 3 seconds...");
 
             Thread.Sleep(3000);
 
             Console.WriteLine();
-            Console.WriteLine(">>> MOVE ODIN NOW <<<");
+            Console.WriteLine(">>> RECORDING STILL DATA FOR 5 SECONDS <<<");
             Console.WriteLine();
 
-            var movingPackets = Capture(10000);
+            List<byte[]> stillPackets =
+                CaptureTimed(5000);
 
             Console.WriteLine();
             Console.WriteLine(
-                $"Captured {movingPackets.Count} MOVING packets.");
+                $"STILL finished: {stillPackets.Count} packets");
+            Console.WriteLine();
+
+            // ============================================
+            // PHASE 2
+            // ============================================
+
+            Console.WriteLine("==============================================");
+            Console.WriteLine(" PHASE 2 - MOVE ODIN STRONGLY");
+            Console.WriteLine("==============================================");
+            Console.WriteLine();
+            Console.WriteLine("Pick Odin up.");
+            Console.WriteLine();
+            Console.WriteLine("During the test:");
+            Console.WriteLine("  - rotate LEFT / RIGHT");
+            Console.WriteLine("  - tilt UP / DOWN");
+            Console.WriteLine("  - roll clockwise / counter-clockwise");
+            Console.WriteLine();
+            Console.WriteLine("Starting in 3 seconds...");
+
+            Thread.Sleep(3000);
 
             Console.WriteLine();
-            Console.WriteLine("Analyzing...");
+            Console.WriteLine(">>> MOVE / ROTATE ODIN NOW! <<<");
             Console.WriteLine();
+
+            List<byte[]> movingPackets =
+                CaptureTimed(10000);
+
+            Console.WriteLine();
+            Console.WriteLine(
+                $"MOVING finished: {movingPackets.Count} packets");
+            Console.WriteLine();
+
+            // ============================================
+            // ANALYSIS
+            // ============================================
+
+            if (stillPackets.Count < 5 ||
+                movingPackets.Count < 5)
+            {
+                Console.WriteLine("ERROR:");
+                Console.WriteLine(
+                    "Not enough DSU packets were captured.");
+                Console.WriteLine();
+                Console.WriteLine(
+                    "Keep AndroidDSU running on Odin during BOTH phases.");
+                Console.WriteLine();
+                Console.WriteLine("Press ENTER to exit.");
+                Console.ReadLine();
+                return;
+            }
 
             Analyze(stillPackets, movingPackets);
 
             Console.WriteLine();
-            Console.WriteLine("===========================================");
+            Console.WriteLine("==============================================");
             Console.WriteLine(" TEST FINISHED");
-            Console.WriteLine("===========================================");
+            Console.WriteLine("==============================================");
             Console.WriteLine();
             Console.WriteLine(
-                "Take a clear photo of ALL results and send it.");
+                "Take photos of TOP BYTE MOTION CANDIDATES");
+            Console.WriteLine(
+                "and FLOAT32 MOTION CANDIDATES.");
             Console.WriteLine();
             Console.WriteLine("Press ENTER to exit.");
 
@@ -138,30 +160,97 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine();
-            Console.WriteLine("ERROR:");
-            Console.WriteLine(ex.ToString());
+            Console.WriteLine("==============================================");
+            Console.WriteLine(" ERROR");
+            Console.WriteLine("==============================================");
+            Console.WriteLine();
+            Console.WriteLine(ex);
             Console.WriteLine();
             Console.WriteLine("Press ENTER to exit.");
             Console.ReadLine();
         }
     }
 
-    static List<byte[]> Capture(int milliseconds)
+    static void SendInitialRequests()
+    {
+        Send(
+            MsgVersion,
+            new byte[] { 0xE9, 0x03 });
+
+        Send(
+            MsgPorts,
+            new byte[]
+            {
+                0x01,
+                0x00,
+                0x00,
+                0x00,
+                0x00
+            });
+
+        Send(
+            MsgPad,
+            new byte[8]);
+    }
+
+    static byte[] WaitForFirstPacket()
+    {
+        long lastRequest =
+            Environment.TickCount64;
+
+        while (true)
+        {
+            byte[]? p = TryReceivePadPacket();
+
+            if (p != null)
+                return p;
+
+            // Re-send subscription periodically.
+            if (Environment.TickCount64 - lastRequest > 1000)
+            {
+                Send(MsgPad, new byte[8]);
+                lastRequest = Environment.TickCount64;
+            }
+        }
+    }
+
+    static List<byte[]> CaptureTimed(int durationMs)
     {
         List<byte[]> packets = new();
 
-        long start = Environment.TickCount64;
+        long start =
+            Environment.TickCount64;
 
-        while (Environment.TickCount64 - start < milliseconds)
+        long lastPrint = start;
+        long lastRequest = start;
+
+        while (Environment.TickCount64 - start < durationMs)
         {
-            byte[] p = ReceivePadPacket();
+            byte[]? p =
+                TryReceivePadPacket();
 
-            packets.Add(p);
+            if (p != null)
+                packets.Add(p);
 
-            if (packets.Count % 100 == 0)
+            long now =
+                Environment.TickCount64;
+
+            // Keep subscription alive just in case.
+            if (now - lastRequest >= 1000)
             {
+                Send(MsgPad, new byte[8]);
+                lastRequest = now;
+            }
+
+            if (now - lastPrint >= 500)
+            {
+                double elapsed =
+                    (now - start) / 1000.0;
+
                 Console.Write(
-                    $"\rPackets: {packets.Count}");
+                    $"\rTime: {elapsed:F1}s   Packets: {packets.Count}      ");
+
+                lastPrint = now;
             }
         }
 
@@ -170,32 +259,49 @@ class Program
         return packets;
     }
 
-    static byte[] ReceivePadPacket()
+    static byte[]? TryReceivePadPacket()
     {
-        while (true)
+        try
         {
             IPEndPoint remote =
-                new IPEndPoint(IPAddress.Any, 0);
+                new IPEndPoint(
+                    IPAddress.Any, 0);
 
-            byte[] p = udp.Receive(ref remote);
+            byte[] p =
+                udp.Receive(ref remote);
 
             if (p.Length < 20)
-                continue;
+                return null;
 
             if (p[0] != (byte)'D' ||
                 p[1] != (byte)'S' ||
                 p[2] != (byte)'U' ||
                 p[3] != (byte)'S')
-                continue;
+            {
+                return null;
+            }
 
             uint type =
                 BinaryPrimitives.ReadUInt32LittleEndian(
                     p.AsSpan(16, 4));
 
             if (type != MsgPad)
-                continue;
+                return null;
 
             return p;
+        }
+        catch (SocketException ex)
+        {
+            // 10060 = Receive timeout on Windows.
+            if (ex.SocketErrorCode ==
+                    SocketError.TimedOut ||
+                ex.SocketErrorCode ==
+                    SocketError.WouldBlock)
+            {
+                return null;
+            }
+
+            throw;
         }
     }
 
@@ -203,92 +309,83 @@ class Program
         List<byte[]> stillPackets,
         List<byte[]> movingPackets)
     {
-        if (stillPackets.Count == 0 ||
-            movingPackets.Count == 0)
-        {
-            Console.WriteLine(
-                "Not enough packets for analysis.");
-            return;
-        }
+        int length =
+            Math.Min(
+                stillPackets.Min(p => p.Length),
+                movingPackets.Min(p => p.Length));
 
-        int length = Math.Min(
-            stillPackets.Min(x => x.Length),
-            movingPackets.Min(x => x.Length));
-
+        Console.WriteLine("==============================================");
+        Console.WriteLine(" ANALYSIS");
+        Console.WriteLine("==============================================");
+        Console.WriteLine();
+        Console.WriteLine($"Common packet length: {length}");
         Console.WriteLine(
-            $"Common packet length: {length}");
+            $"Still packets : {stillPackets.Count}");
+        Console.WriteLine(
+            $"Moving packets: {movingPackets.Count}");
         Console.WriteLine();
 
-        List<ByteResult> results = new();
+        List<ByteResult> byteResults = new();
 
-        // Ignore DSU header area.
-        // Start at byte 20.
-        for (int offset = 20; offset < length; offset++)
+        for (int offset = 20;
+             offset < length;
+             offset++)
         {
-            double stillMean =
-                stillPackets.Average(p => (double)p[offset]);
-
-            double movingMean =
-                movingPackets.Average(p => (double)p[offset]);
-
-            double stillVariation =
-                AverageDifference(
+            double stillVar =
+                ByteAverageDifference(
                     stillPackets,
                     offset);
 
-            double movingVariation =
-                AverageDifference(
+            double moveVar =
+                ByteAverageDifference(
                     movingPackets,
                     offset);
 
+            double stillRange =
+                ByteRange(
+                    stillPackets,
+                    offset);
+
+            double moveRange =
+                ByteRange(
+                    movingPackets,
+                    offset);
+
+            double variationRatio =
+                moveVar /
+                Math.Max(0.05, stillVar);
+
+            double rangeRatio =
+                moveRange /
+                Math.Max(1.0, stillRange);
+
             double score =
-                movingVariation /
-                Math.Max(0.05, stillVariation);
+                variationRatio * rangeRatio;
 
-            double rangeStill =
-                Range(stillPackets, offset);
-
-            double rangeMoving =
-                Range(movingPackets, offset);
-
-            // Strong motion candidates should change
-            // much more while moving than while stationary.
-            double rangeScore =
-                rangeMoving /
-                Math.Max(1.0, rangeStill);
-
-            double finalScore =
-                score * rangeScore;
-
-            results.Add(
+            byteResults.Add(
                 new ByteResult
                 {
                     Offset = offset,
-                    StillMean = stillMean,
-                    MovingMean = movingMean,
-                    StillVariation = stillVariation,
-                    MovingVariation = movingVariation,
-                    StillRange = rangeStill,
-                    MovingRange = rangeMoving,
-                    Score = finalScore
+                    StillVariation = stillVar,
+                    MovingVariation = moveVar,
+                    StillRange = stillRange,
+                    MovingRange = moveRange,
+                    Score = score
                 });
         }
 
-        Console.WriteLine(
-            "===========================================");
-        Console.WriteLine(
-            " TOP BYTE MOTION CANDIDATES");
-        Console.WriteLine(
-            "===========================================");
+        Console.WriteLine("==============================================");
+        Console.WriteLine(" TOP BYTE MOTION CANDIDATES");
+        Console.WriteLine("==============================================");
         Console.WriteLine();
 
-        foreach (var r in results
-            .OrderByDescending(x => x.Score)
+        foreach (ByteResult r in byteResults
+            .OrderByDescending(r => r.Score)
             .Take(30))
         {
             Console.WriteLine(
-                $"OFFSET {r.Offset,3} | " +
-                $"score {r.Score,10:F2} | " +
+                $"BYTE {r.Offset,3} | " +
+                $"SCORE {r.Score,10:F2} | " +
                 $"stillVar {r.StillVariation,7:F2} | " +
                 $"moveVar {r.MovingVariation,7:F2} | " +
                 $"stillRange {r.StillRange,6:F0} | " +
@@ -296,85 +393,89 @@ class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine(
-            "===========================================");
-        Console.WriteLine(
-            " FLOAT32 MOTION SCAN");
-        Console.WriteLine(
-            "===========================================");
+        Console.WriteLine("==============================================");
+        Console.WriteLine(" FLOAT32 MOTION CANDIDATES");
+        Console.WriteLine("==============================================");
         Console.WriteLine();
 
-        List<FloatResult> floatResults = new();
+        List<FloatResult> floatResults =
+            new();
 
-        // Test EVERY byte alignment, not only
-        // multiples of four.
-        for (int offset = 20; offset <= length - 4; offset++)
+        // IMPORTANT:
+        // Scan every possible byte alignment.
+        for (int offset = 20;
+             offset <= length - 4;
+             offset++)
         {
-            var stillValues =
-                ExtractFloats(stillPackets, offset);
+            List<float> still =
+                ExtractFloats(
+                    stillPackets,
+                    offset);
 
-            var movingValues =
-                ExtractFloats(movingPackets, offset);
+            List<float> moving =
+                ExtractFloats(
+                    movingPackets,
+                    offset);
 
-            if (stillValues.Count < 5 ||
-                movingValues.Count < 5)
+            still =
+                still.Where(IsReasonableFloat)
+                     .ToList();
+
+            moving =
+                moving.Where(IsReasonableFloat)
+                      .ToList();
+
+            if (still.Count < 5 ||
+                moving.Count < 5)
+            {
                 continue;
-
-            // Remove impossible / NaN / gigantic floats.
-            stillValues = stillValues
-                .Where(IsReasonableFloat)
-                .ToList();
-
-            movingValues = movingValues
-                .Where(IsReasonableFloat)
-                .ToList();
-
-            if (stillValues.Count < 5 ||
-                movingValues.Count < 5)
-                continue;
+            }
 
             double stillRange =
-                FloatRange(stillValues);
+                FloatRange(still);
 
-            double movingRange =
-                FloatRange(movingValues);
+            double moveRange =
+                FloatRange(moving);
 
-            double stillVariation =
-                FloatAverageDifference(stillValues);
+            double stillVar =
+                FloatAverageDifference(still);
 
-            double movingVariation =
-                FloatAverageDifference(movingValues);
+            double moveVar =
+                FloatAverageDifference(moving);
+
+            if (moveRange < 0.000001)
+                continue;
+
+            double variationRatio =
+                moveVar /
+                Math.Max(0.000001, stillVar);
+
+            double rangeRatio =
+                moveRange /
+                Math.Max(0.000001, stillRange);
 
             double score =
-                (movingVariation /
-                 Math.Max(0.0001, stillVariation))
-                *
-                (movingRange /
-                 Math.Max(0.001, stillRange));
-
-            // Ignore essentially dead fields.
-            if (movingRange < 0.001)
-                continue;
+                variationRatio * rangeRatio;
 
             floatResults.Add(
                 new FloatResult
                 {
                     Offset = offset,
+                    StillVariation = stillVar,
+                    MovingVariation = moveVar,
                     StillRange = stillRange,
-                    MovingRange = movingRange,
-                    StillVariation = stillVariation,
-                    MovingVariation = movingVariation,
+                    MovingRange = moveRange,
                     Score = score
                 });
         }
 
-        foreach (var r in floatResults
-            .OrderByDescending(x => x.Score)
+        foreach (FloatResult r in floatResults
+            .OrderByDescending(r => r.Score)
             .Take(30))
         {
             Console.WriteLine(
                 $"FLOAT @{r.Offset,3} | " +
-                $"score {r.Score,12:F2} | " +
+                $"SCORE {r.Score,12:F2} | " +
                 $"stillRange {r.StillRange,12:F6} | " +
                 $"moveRange {r.MovingRange,12:F6} | " +
                 $"stillVar {r.StillVariation,12:F6} | " +
@@ -382,55 +483,54 @@ class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine(
-            "===========================================");
-        Console.WriteLine(
-            " KNOWN SENSOR AREA 60-99");
-        Console.WriteLine(
-            "===========================================");
+        Console.WriteLine("==============================================");
+        Console.WriteLine(" OFFSETS 60-99 DETAIL");
+        Console.WriteLine("==============================================");
         Console.WriteLine();
 
-        int end = Math.Min(99, length - 1);
-
-        for (int offset = 60; offset <= end; offset++)
+        foreach (ByteResult r in byteResults
+            .Where(r =>
+                r.Offset >= 60 &&
+                r.Offset <= 99))
         {
-            var r = results.First(x => x.Offset == offset);
-
             Console.WriteLine(
-                $"{offset,3}: " +
-                $"stillVar={r.StillVariation,7:F2} " +
-                $"moveVar={r.MovingVariation,7:F2} " +
-                $"range={r.MovingRange,6:F0} " +
+                $"{r.Offset,3} | " +
+                $"stillVar={r.StillVariation,7:F2} | " +
+                $"moveVar={r.MovingVariation,7:F2} | " +
+                $"stillRange={r.StillRange,6:F0} | " +
+                $"moveRange={r.MovingRange,6:F0} | " +
                 $"score={r.Score,10:F2}");
         }
 
         Console.WriteLine();
-        Console.WriteLine(
-            "===========================================");
-        Console.WriteLine(
-            " FLOAT VALUES 60-99 FROM LAST MOVING PACKET");
-        Console.WriteLine(
-            "===========================================");
+        Console.WriteLine("==============================================");
+        Console.WriteLine(" LAST PACKET FLOAT32 VALUES");
+        Console.WriteLine("==============================================");
         Console.WriteLine();
 
-        byte[] last = movingPackets[^1];
+        byte[] last =
+            movingPackets[^1];
 
         for (int offset = 60;
-             offset <= Math.Min(96, last.Length - 4);
+             offset <= Math.Min(
+                 96,
+                 last.Length - 4);
              offset++)
         {
             float value =
-                BitConverter.ToSingle(last, offset);
+                BitConverter.ToSingle(
+                    last,
+                    offset);
 
             if (IsReasonableFloat(value))
             {
                 Console.WriteLine(
-                    $"OFFSET {offset,3} = {value,14:F6}");
+                    $"FLOAT @{offset,3} = {value,14:F6}");
             }
         }
     }
 
-    static double AverageDifference(
+    static double ByteAverageDifference(
         List<byte[]> packets,
         int offset)
     {
@@ -439,29 +539,36 @@ class Program
 
         double total = 0;
 
-        for (int i = 1; i < packets.Count; i++)
+        for (int i = 1;
+             i < packets.Count;
+             i++)
         {
-            total += Math.Abs(
-                packets[i][offset] -
-                packets[i - 1][offset]);
+            total +=
+                Math.Abs(
+                    packets[i][offset] -
+                    packets[i - 1][offset]);
         }
 
-        return total / (packets.Count - 1);
+        return total /
+               (packets.Count - 1);
     }
 
-    static double Range(
+    static double ByteRange(
         List<byte[]> packets,
         int offset)
     {
-        byte min = 255;
-        byte max = 0;
+        int min = 255;
+        int max = 0;
 
         foreach (byte[] p in packets)
         {
-            byte v = p[offset];
+            int v = p[offset];
 
-            if (v < min) min = v;
-            if (v > max) max = v;
+            if (v < min)
+                min = v;
+
+            if (v > max)
+                max = v;
         }
 
         return max - min;
@@ -471,7 +578,8 @@ class Program
         List<byte[]> packets,
         int offset)
     {
-        List<float> values = new();
+        List<float> result =
+            new();
 
         foreach (byte[] p in packets)
         {
@@ -479,50 +587,63 @@ class Program
                 continue;
 
             float f =
-                BitConverter.ToSingle(p, offset);
+                BitConverter.ToSingle(
+                    p,
+                    offset);
 
             if (!float.IsNaN(f) &&
                 !float.IsInfinity(f))
             {
-                values.Add(f);
+                result.Add(f);
             }
         }
 
-        return values;
+        return result;
     }
 
     static bool IsReasonableFloat(float f)
     {
         if (float.IsNaN(f) ||
             float.IsInfinity(f))
+        {
             return false;
+        }
 
-        return Math.Abs(f) < 100000.0f;
+        return Math.Abs(f) <
+               100000.0f;
     }
 
-    static double FloatRange(List<float> v)
+    static double FloatRange(
+        List<float> values)
     {
-        if (v.Count == 0)
+        if (values.Count == 0)
             return 0;
 
-        return v.Max() - v.Min();
+        return
+            (double)values.Max() -
+            values.Min();
     }
 
     static double FloatAverageDifference(
-        List<float> v)
+        List<float> values)
     {
-        if (v.Count < 2)
+        if (values.Count < 2)
             return 0;
 
         double total = 0;
 
-        for (int i = 1; i < v.Count; i++)
+        for (int i = 1;
+             i < values.Count;
+             i++)
         {
             total +=
-                Math.Abs(v[i] - v[i - 1]);
+                Math.Abs(
+                    values[i] -
+                    values[i - 1]);
         }
 
-        return total / (v.Count - 1);
+        return total /
+               (values.Count - 1);
     }
 
     static void Send(
@@ -557,7 +678,9 @@ class Program
             p.AsSpan(16, 4),
             type);
 
-        payload.CopyTo(p, 20);
+        payload.CopyTo(
+            p,
+            20);
 
         BinaryPrimitives.WriteUInt32LittleEndian(
             p.AsSpan(8, 4),
@@ -571,23 +694,28 @@ class Program
 
     static uint Crc32(byte[] b)
     {
-        uint crc = 0xFFFFFFFF;
+        uint crc =
+            0xFFFFFFFF;
 
-        for (int i = 0; i < b.Length; i++)
+        for (int i = 0;
+             i < b.Length;
+             i++)
         {
             byte x =
                 (i >= 8 && i < 12)
-                ? (byte)0
-                : b[i];
+                    ? (byte)0
+                    : b[i];
 
             crc ^= x;
 
-            for (int j = 0; j < 8; j++)
+            for (int j = 0;
+                 j < 8;
+                 j++)
             {
                 crc =
                     (crc >> 1) ^
                     (0xEDB88320u &
-                    (uint)-(int)(crc & 1));
+                     (uint)-(int)(crc & 1));
             }
         }
 
@@ -597,8 +725,6 @@ class Program
     sealed class ByteResult
     {
         public int Offset;
-        public double StillMean;
-        public double MovingMean;
         public double StillVariation;
         public double MovingVariation;
         public double StillRange;
@@ -609,10 +735,10 @@ class Program
     sealed class FloatResult
     {
         public int Offset;
-        public double StillRange;
-        public double MovingRange;
         public double StillVariation;
         public double MovingVariation;
+        public double StillRange;
+        public double MovingRange;
         public double Score;
     }
 }
