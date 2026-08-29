@@ -1,0 +1,43 @@
+name: Build OdinGyroBridge EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore OdinPortalDsuDs4Bridge.csproj
+
+      - name: Publish Windows x64 single-file EXE
+        run: >
+          dotnet publish OdinPortalDsuDs4Bridge.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:PublishTrimmed=false
+          -o publish
+
+      - name: Show output
+        shell: pwsh
+        run: Get-ChildItem -Recurse publish
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OdinGyroBridge-Windows-x64
+          path: publish/OdinGyroBridge.exe
+          if-no-files-found: error
