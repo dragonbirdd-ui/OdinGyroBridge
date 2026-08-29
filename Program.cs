@@ -35,7 +35,7 @@ internal static class Program
         Console.Clear();
 
         Console.WriteLine("============================================================");
-        Console.WriteLine(" Odin 2 Portal DSU Gyro AXIS FINDER v8");
+        Console.WriteLine(" Odin 2 Portal DSU Gyro AXIS FINDER v9 - TIMEOUT FIX");
         Console.WriteLine("============================================================");
         Console.WriteLine();
 
@@ -247,32 +247,40 @@ internal static class Program
         long start = Environment.TickCount64;
         long end = start + seconds * 1000L;
         long lastPrint = start;
+        long lastSubscribe = 0;
 
-        while (Environment.TickCount64 < end)
+        // Timed phases must never wait forever inside udp.Receive().
+        // Refresh DSU registration too, because some servers expire it.
+        while (true)
         {
-            byte[] p = ReceivePad();
-
-            // Clone because we want an independent stored packet.
-            c.Packets.Add((byte[])p.Clone());
-
             long now = Environment.TickCount64;
+            if (now >= end)
+                break;
 
+            if (now - lastSubscribe >= 1000)
+            {
+                Subscribe();
+                lastSubscribe = now;
+            }
+
+            if (TryReceivePad(50, out byte[]? p) && p != null)
+                c.Packets.Add((byte[])p.Clone());
+
+            now = Environment.TickCount64;
             if (now - lastPrint >= 1000)
             {
-                double elapsed = (now - start) / 1000.0;
-
+                double elapsed = Math.Min(seconds, (now - start) / 1000.0);
                 Console.WriteLine(
-                    $"{name,-14}  Time: {elapsed,5:F1}s   Packets: {c.Packets.Count}");
-
+                    $"{name,-14}  Time: {elapsed,5:F1}s / {seconds}s   Packets: {c.Packets.Count}");
                 lastPrint = now;
             }
         }
 
+        Console.WriteLine(
+            $"{name,-14}  Time: {seconds,5:F1}s / {seconds}s   Packets: {c.Packets.Count}");
         Console.WriteLine();
         Console.WriteLine($"{name} finished: {c.Packets.Count} packets");
-
-        Thread.Sleep(1200);
-
+        Thread.Sleep(800);
         return c;
     }
 
@@ -717,6 +725,40 @@ internal static class Program
 
             return p;
         }
+    }
+
+    static bool TryReceivePad(int timeoutMs, out byte[]? packet)
+    {
+        packet = null;
+        long deadline = Environment.TickCount64 + timeoutMs;
+
+        while (Environment.TickCount64 < deadline)
+        {
+            // Socket.Poll timeout is in microseconds.
+            if (!udp.Client.Poll(10_000, SelectMode.SelectRead))
+                continue;
+
+            IPEndPoint remote = new(IPAddress.Any, 0);
+            byte[] p = udp.Receive(ref remote);
+
+            if (p.Length < 20)
+                continue;
+
+            if (p[0] != (byte)'D' ||
+                p[1] != (byte)'S' ||
+                p[2] != (byte)'U' ||
+                p[3] != (byte)'S')
+                continue;
+
+            uint type = BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(16, 4));
+            if (type != MsgPad)
+                continue;
+
+            packet = p;
+            return true;
+        }
+
+        return false;
     }
 
     static void Send(uint type, byte[] payload)
