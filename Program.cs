@@ -42,98 +42,50 @@ internal static class Vigem
         IntPtr target,
         DS4_REPORT_EX report);
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    public struct DS4_TOUCH
-    {
-        public byte bPacketCounter;
-        public byte bIsUpTrackingNum1;
-
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
-        public byte[] bTouchData1;
-
-        public byte bIsUpTrackingNum2;
-
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
-        public byte[] bTouchData2;
-
-        public static DS4_TOUCH Empty()
-        {
-            return new DS4_TOUCH
-            {
-                bPacketCounter = 0,
-                bIsUpTrackingNum1 = 0x80,
-                bTouchData1 = new byte[3],
-                bIsUpTrackingNum2 = 0x80,
-                bTouchData2 = new byte[3]
-            };
-        }
-    }
-
+    // Raw 63-byte DS4_REPORT_EX.
+    // This avoids nested C# struct-marshalling ambiguity.
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public struct DS4_REPORT_EX
     {
-        public byte bThumbLX;
-        public byte bThumbLY;
-        public byte bThumbRX;
-        public byte bThumbRY;
-
-        public ushort wButtons;
-
-        public byte bSpecial;
-        public byte bTriggerL;
-        public byte bTriggerR;
-
-        public ushort wTimestamp;
-
-        public byte bBatteryLvl;
-
-        public short wGyroX;
-        public short wGyroY;
-        public short wGyroZ;
-
-        public short wAccelX;
-        public short wAccelY;
-        public short wAccelZ;
-
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 5)]
-        public byte[] Unknown1;
-
-        public byte bBatteryLvlSpecial;
-
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
-        public byte[] Unknown2;
-
-        public byte bTouchPacketsN;
-
-        public DS4_TOUCH sCurrentTouch;
-        public DS4_TOUCH sPreviousTouch1;
-        public DS4_TOUCH sPreviousTouch2;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 63)]
+        public byte[] Report;
 
         public static DS4_REPORT_EX Create()
         {
-            return new DS4_REPORT_EX
+            var r = new DS4_REPORT_EX
             {
-                bThumbLX = 128,
-                bThumbLY = 128,
-                bThumbRX = 128,
-                bThumbRY = 128,
-
-                wButtons = 8,
-
-                bBatteryLvl = 0xFF,
-
-                Unknown1 = new byte[5],
-
-                bBatteryLvlSpecial = 0x1A,
-
-                Unknown2 = new byte[2],
-
-                bTouchPacketsN = 1,
-
-                sCurrentTouch = DS4_TOUCH.Empty(),
-                sPreviousTouch1 = DS4_TOUCH.Empty(),
-                sPreviousTouch2 = DS4_TOUCH.Empty()
+                Report = new byte[63]
             };
+
+            // Analog sticks centered
+            r.Report[0] = 128; // LX
+            r.Report[1] = 128; // LY
+            r.Report[2] = 128; // RX
+            r.Report[3] = 128; // RY
+
+            // D-pad neutral
+            r.Report[4] = 8;
+
+            // Battery
+            r.Report[11] = 0xFF;
+
+            // Battery / connection information
+            r.Report[29] = 0x1A;
+
+            // Touch packet count
+            r.Report[32] = 1;
+
+            // Touch fingers UP
+            r.Report[34] = 0x80;
+            r.Report[38] = 0x80;
+
+            r.Report[43] = 0x80;
+            r.Report[47] = 0x80;
+
+            r.Report[52] = 0x80;
+            r.Report[56] = 0x80;
+
+            return r;
         }
     }
 }
@@ -156,7 +108,9 @@ internal sealed class Bridge : IDisposable
     readonly IntPtr target;
 
     readonly uint id =
-        (uint)Random.Shared.Next(1, int.MaxValue);
+        (uint)Random.Shared.Next(
+            1,
+            int.MaxValue);
 
     ushort timestamp;
 
@@ -170,26 +124,32 @@ internal sealed class Bridge : IDisposable
                 IPAddress.Parse(ip),
                 Port);
 
-        client = Vigem.vigem_alloc();
+        client =
+            Vigem.vigem_alloc();
 
         if (client == IntPtr.Zero)
+        {
             throw new Exception(
-                "vigem_alloc failed");
+                "ViGEmClient.dll: vigem_alloc failed.");
+        }
 
         uint error =
             Vigem.vigem_connect(client);
 
         if (error != Vigem.Success)
+        {
             throw new Exception(
-                "ViGEm connect failed: 0x" +
-                error.ToString("X8"));
+                $"ViGEm connect failed: 0x{error:X8}");
+        }
 
         target =
             Vigem.vigem_target_ds4_alloc();
 
         if (target == IntPtr.Zero)
+        {
             throw new Exception(
-                "DS4 allocation failed");
+                "vigem_target_ds4_alloc failed.");
+        }
 
         error =
             Vigem.vigem_target_add(
@@ -197,29 +157,29 @@ internal sealed class Bridge : IDisposable
                 target);
 
         if (error != Vigem.Success)
+        {
             throw new Exception(
-                "DS4 target_add failed: 0x" +
-                error.ToString("X8"));
+                $"ViGEm target_add failed: 0x{error:X8}");
+        }
     }
 
     public void Run()
     {
-        Console.WriteLine(
-            "==============================================");
+        Console.Clear();
 
         Console.WriteLine(
-            " ODIN DSU -> VIRTUAL DS4 MOTION BRIDGE v10");
+            "============================================================");
 
         Console.WriteLine(
-            "==============================================");
+            " ODIN 2 PORTAL DSU -> VIRTUAL DS4 BRIDGE v11 RAW63");
+
+        Console.WriteLine(
+            "============================================================");
 
         Console.WriteLine();
 
         Console.WriteLine(
-            "DSU source : " +
-            portal.Address +
-            ":" +
-            Port);
+            $"Portal DSU : {portal.Address}:{Port}");
 
         Console.WriteLine(
             "Virtual DS4: READY");
@@ -227,18 +187,35 @@ internal sealed class Bridge : IDisposable
         Console.WriteLine();
 
         Console.WriteLine(
-            "DSU layout:");
+            "DSU ACCEL:");
 
         Console.WriteLine(
-            "Accel = Float32 @ 76 / 80 / 84");
+            "  X @76");
 
         Console.WriteLine(
-            "Gyro  = Float32 @ 88 / 92 / 96");
+            "  Y @80");
+
+        Console.WriteLine(
+            "  Z @84");
 
         Console.WriteLine();
 
         Console.WriteLine(
-            "Move Odin. Values below MUST change.");
+            "DSU GYRO:");
+
+        Console.WriteLine(
+            "  X @88");
+
+        Console.WriteLine(
+            "  Y @92");
+
+        Console.WriteLine(
+            "  Z @96");
+
+        Console.WriteLine();
+
+        Console.WriteLine(
+            "Move Odin - GYRO and DS4 RAW values must change.");
 
         Console.WriteLine();
 
@@ -246,10 +223,13 @@ internal sealed class Bridge : IDisposable
 
         while (true)
         {
+            // Refresh AndroidDSU subscription every second.
             if (Environment.TickCount64 -
-                lastSubscribe > 1000)
+                lastSubscribe >= 1000)
             {
-                Send(MsgPad, new byte[8]);
+                Send(
+                    MsgPad,
+                    new byte[8]);
 
                 lastSubscribe =
                     Environment.TickCount64;
@@ -261,16 +241,21 @@ internal sealed class Bridge : IDisposable
                     0);
 
             byte[] p =
-                udp.Receive(ref remote);
+                udp.Receive(
+                    ref remote);
 
+            // We need up to offset 99.
             if (p.Length < 100)
                 continue;
 
+            // DSUS response signature
             if (p[0] != (byte)'D' ||
                 p[1] != (byte)'S' ||
                 p[2] != (byte)'U' ||
                 p[3] != (byte)'S')
+            {
                 continue;
+            }
 
             uint type =
                 BinaryPrimitives
@@ -280,85 +265,170 @@ internal sealed class Bridge : IDisposable
             if (type != MsgPad)
                 continue;
 
+            // DSU connected state
             if (p[21] != 2)
                 continue;
 
+            // ========================================================
+            // READ ANDROID DSU MOTION
+            // ========================================================
+
             float ax =
-                BitConverter.ToSingle(p, 76);
+                BitConverter.ToSingle(
+                    p,
+                    76);
 
             float ay =
-                BitConverter.ToSingle(p, 80);
+                BitConverter.ToSingle(
+                    p,
+                    80);
 
             float az =
-                BitConverter.ToSingle(p, 84);
+                BitConverter.ToSingle(
+                    p,
+                    84);
 
             float gx =
-                BitConverter.ToSingle(p, 88);
+                BitConverter.ToSingle(
+                    p,
+                    88);
 
             float gy =
-                BitConverter.ToSingle(p, 92);
+                BitConverter.ToSingle(
+                    p,
+                    92);
 
             float gz =
-                BitConverter.ToSingle(p, 96);
+                BitConverter.ToSingle(
+                    p,
+                    96);
 
-            var report =
+            // Reject broken packets.
+            if (!float.IsFinite(ax) ||
+                !float.IsFinite(ay) ||
+                !float.IsFinite(az) ||
+                !float.IsFinite(gx) ||
+                !float.IsFinite(gy) ||
+                !float.IsFinite(gz))
+            {
+                continue;
+            }
+
+            // ========================================================
+            // CREATE RAW DS4 REPORT
+            // ========================================================
+
+            Vigem.DS4_REPORT_EX report =
                 Vigem.DS4_REPORT_EX.Create();
 
-            // ------------------------------------------------
-            // Controller state
-            // ------------------------------------------------
+            byte[] r =
+                report.Report;
 
-            report.bThumbLX = p[40];
-            report.bThumbLY = p[41];
-            report.bThumbRX = p[42];
-            report.bThumbRY = p[43];
+            // ========================================================
+            // STICKS
+            // ========================================================
 
-            CopyButtons(p, ref report);
+            r[0] = p[40];
+            r[1] = p[41];
+            r[2] = p[42];
+            r[3] = p[43];
 
-            // ------------------------------------------------
-            // DS4 timestamp
-            //
-            // DS4 commonly updates around 800 Hz.
-            // Incrementing continuously is important for
-            // motion consumers.
-            // ------------------------------------------------
+            // ========================================================
+            // BUTTONS
+            // ========================================================
+
+            CopyButtonsRaw(
+                p,
+                r);
+
+            // ========================================================
+            // TIMESTAMP
+            // ========================================================
 
             timestamp += 188;
 
-            report.wTimestamp =
-                timestamp;
+            WriteU16(
+                r,
+                9,
+                timestamp);
 
-            // ------------------------------------------------
-            // MOTION
+            // ========================================================
+            // GYROSCOPE
             //
-            // AndroidDSU gyro = degrees/sec
+            // AndroidDSU:
+            // degrees/sec
             //
             // DS4:
             // 16 raw units = 1 degree/sec
+            // ========================================================
+
+            short gyroX =
+                ToShort(
+                    gx * 16.0);
+
+            short gyroY =
+                ToShort(
+                    gy * 16.0);
+
+            short gyroZ =
+                ToShort(
+                    gz * 16.0);
+
+            WriteI16(
+                r,
+                12,
+                gyroX);
+
+            WriteI16(
+                r,
+                14,
+                gyroY);
+
+            WriteI16(
+                r,
+                16,
+                gyroZ);
+
+            // ========================================================
+            // ACCELEROMETER
             //
-            // AndroidDSU accel values observed are in g.
+            // AndroidDSU:
+            // approximately g
             //
             // DS4:
             // 8192 raw units = 1 g
-            // ------------------------------------------------
+            // ========================================================
 
-            report.wGyroX =
-                ToShort(gx * 16.0);
+            short accelX =
+                ToShort(
+                    ax * 8192.0);
 
-            report.wGyroY =
-                ToShort(gy * 16.0);
+            short accelY =
+                ToShort(
+                    ay * 8192.0);
 
-            report.wGyroZ =
-                ToShort(gz * 16.0);
+            short accelZ =
+                ToShort(
+                    az * 8192.0);
 
-            report.wAccelX =
-                ToShort(ax * 8192.0);
+            WriteI16(
+                r,
+                18,
+                accelX);
 
-            report.wAccelY =
-                ToShort(ay * 8192.0);
+            WriteI16(
+                r,
+                20,
+                accelY);
 
-            report.wAccelZ =
-                ToShort(az * 8192.0);
+            WriteI16(
+                r,
+                22,
+                accelZ);
+
+            // ========================================================
+            // SEND REPORT TO VIRTUAL DS4
+            // ========================================================
 
             uint error =
                 Vigem.vigem_target_ds4_update_ex(
@@ -369,9 +439,12 @@ internal sealed class Bridge : IDisposable
             if (error != Vigem.Success)
             {
                 throw new Exception(
-                    "DS4 update failed: 0x" +
-                    error.ToString("X8"));
+                    $"ViGEm DS4 update failed: 0x{error:X8}");
             }
+
+            // ========================================================
+            // DEBUG OUTPUT
+            // ========================================================
 
             if (Environment.TickCount64 -
                 lastPrint >= 250)
@@ -382,9 +455,9 @@ internal sealed class Bridge : IDisposable
                     $"Y={gy,8:F2} " +
                     $"Z={gz,8:F2}   |   " +
                     $"DS4 RAW " +
-                    $"X={report.wGyroX,6} " +
-                    $"Y={report.wGyroY,6} " +
-                    $"Z={report.wGyroZ,6}");
+                    $"X={gyroX,6} " +
+                    $"Y={gyroY,6} " +
+                    $"Z={gyroZ,6}");
 
                 lastPrint =
                     Environment.TickCount64;
@@ -392,12 +465,19 @@ internal sealed class Bridge : IDisposable
         }
     }
 
-    static void CopyButtons(
+    static void CopyButtonsRaw(
         byte[] p,
-        ref Vigem.DS4_REPORT_EX report)
+        byte[] r)
     {
-        byte b1 = p[36];
-        byte b2 = p[37];
+        byte b1 =
+            p[36];
+
+        byte b2 =
+            p[37];
+
+        // ============================================================
+        // DPAD
+        // ============================================================
 
         bool left =
             (b1 & 0x80) != 0;
@@ -415,22 +495,34 @@ internal sealed class Bridge : IDisposable
 
         if (up && right)
             dpad = 1;
+
         else if (right && down)
             dpad = 3;
+
         else if (down && left)
             dpad = 5;
+
         else if (left && up)
             dpad = 7;
+
         else if (up)
             dpad = 0;
+
         else if (right)
             dpad = 2;
+
         else if (down)
             dpad = 4;
+
         else if (left)
             dpad = 6;
 
-        ushort buttons = dpad;
+        ushort buttons =
+            dpad;
+
+        // ============================================================
+        // FACE / SHOULDER BUTTONS
+        // ============================================================
 
         if ((b2 & 0x01) != 0)
             buttons |= 0x0080;
@@ -456,8 +548,14 @@ internal sealed class Bridge : IDisposable
         if ((b2 & 0x80) != 0)
             buttons |= 0x0400;
 
-        report.wButtons =
-            buttons;
+        WriteU16(
+            r,
+            4,
+            buttons);
+
+        // ============================================================
+        // PS / TOUCHPAD
+        // ============================================================
 
         byte special = 0;
 
@@ -467,23 +565,58 @@ internal sealed class Bridge : IDisposable
         if (p[39] != 0)
             special |= 0x08;
 
-        report.bSpecial =
+        r[6] =
             special;
 
-        report.bTriggerL =
+        // ============================================================
+        // ANALOG TRIGGERS
+        // ============================================================
+
+        r[7] =
             p[35];
 
-        report.bTriggerR =
+        r[8] =
             p[34];
     }
 
-    static short ToShort(double value)
+    static short ToShort(
+        double value)
     {
         return (short)Math.Clamp(
             Math.Round(value),
             short.MinValue,
             short.MaxValue);
     }
+
+    static void WriteI16(
+        byte[] buffer,
+        int offset,
+        short value)
+    {
+        BinaryPrimitives
+            .WriteInt16LittleEndian(
+                buffer.AsSpan(
+                    offset,
+                    2),
+                value);
+    }
+
+    static void WriteU16(
+        byte[] buffer,
+        int offset,
+        ushort value)
+    {
+        BinaryPrimitives
+            .WriteUInt16LittleEndian(
+                buffer.AsSpan(
+                    offset,
+                    2),
+                value);
+    }
+
+    // ================================================================
+    // ANDROID DSU SUBSCRIPTION
+    // ================================================================
 
     void Subscribe()
     {
@@ -523,6 +656,7 @@ internal sealed class Bridge : IDisposable
                 20 +
                 payload.Length];
 
+        // DSUC
         p[0] = (byte)'D';
         p[1] = (byte)'S';
         p[2] = (byte)'U';
@@ -540,6 +674,7 @@ internal sealed class Bridge : IDisposable
                     4 +
                     payload.Length));
 
+        // CRC temporarily zero
         BinaryPrimitives
             .WriteUInt32LittleEndian(
                 p.AsSpan(8, 4),
@@ -559,6 +694,7 @@ internal sealed class Bridge : IDisposable
             p,
             20);
 
+        // Calculate CRC
         BinaryPrimitives
             .WriteUInt32LittleEndian(
                 p.AsSpan(8, 4),
@@ -570,7 +706,8 @@ internal sealed class Bridge : IDisposable
             portal);
     }
 
-    static uint Crc32(byte[] b)
+    static uint Crc32(
+        byte[] b)
     {
         uint crc =
             0xFFFFFFFF;
@@ -585,7 +722,8 @@ internal sealed class Bridge : IDisposable
                     ? (byte)0
                     : b[i];
 
-            crc ^= x;
+            crc ^=
+                x;
 
             for (int j = 0;
                  j < 8;
@@ -593,49 +731,71 @@ internal sealed class Bridge : IDisposable
             {
                 crc =
                     (crc >> 1) ^
-                    (0xEDB88320u &
-                    (uint)-(int)(
-                        crc & 1));
+                    (
+                        0xEDB88320u &
+                        (uint)-(int)(
+                            crc & 1)
+                    );
             }
         }
 
         return ~crc;
     }
 
+    // ================================================================
+    // CLEANUP
+    // ================================================================
+
     public void Dispose()
     {
         try
         {
             if (target != IntPtr.Zero)
+            {
                 Vigem.vigem_target_remove(
                     client,
                     target);
+            }
         }
-        catch { }
+        catch
+        {
+        }
 
         try
         {
             if (target != IntPtr.Zero)
+            {
                 Vigem.vigem_target_free(
                     target);
+            }
         }
-        catch { }
+        catch
+        {
+        }
 
         try
         {
             if (client != IntPtr.Zero)
+            {
                 Vigem.vigem_disconnect(
                     client);
+            }
         }
-        catch { }
+        catch
+        {
+        }
 
         try
         {
             if (client != IntPtr.Zero)
+            {
                 Vigem.vigem_free(
                     client);
+            }
         }
-        catch { }
+        catch
+        {
+        }
 
         udp.Dispose();
     }
@@ -643,10 +803,11 @@ internal sealed class Bridge : IDisposable
 
 internal static class Program
 {
-    static void Main(string[] args)
+    static void Main(
+        string[] args)
     {
         Console.WriteLine(
-            "Odin DSU -> Virtual DS4 Motion Bridge v10");
+            "Odin 2 Portal DSU -> Virtual DS4 Bridge v11 RAW63");
 
         Console.WriteLine();
 
@@ -667,18 +828,25 @@ internal static class Program
         try
         {
             using var bridge =
-                new Bridge(ip.Trim());
+                new Bridge(
+                    ip.Trim());
 
             bridge.Run();
         }
         catch (Exception ex)
         {
             Console.WriteLine();
-            Console.WriteLine("ERROR:");
-            Console.WriteLine(ex);
-            Console.WriteLine();
+
             Console.WriteLine(
-                "Press ENTER to exit.");
+                "ERROR:");
+
+            Console.WriteLine(
+                ex);
+
+            Console.WriteLine();
+
+            Console.WriteLine(
+                "Press ENTER to exit...");
 
             Console.ReadLine();
         }
