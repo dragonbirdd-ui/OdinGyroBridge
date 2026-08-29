@@ -1,713 +1,269 @@
 using System;
 using System.Buffers.Binary;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
+using System.Runtime.InteropServices;
 
-internal static class Program
+internal static class Vigem
+{
+    public const uint Success = 0x20000000;
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr vigem_alloc();
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void vigem_free(IntPtr client);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint vigem_connect(IntPtr client);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void vigem_disconnect(IntPtr client);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr vigem_target_ds4_alloc();
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void vigem_target_free(IntPtr target);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint vigem_target_add(
+        IntPtr client,
+        IntPtr target);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint vigem_target_remove(
+        IntPtr client,
+        IntPtr target);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint vigem_target_ds4_update_ex(
+        IntPtr client,
+        IntPtr target,
+        DS4_REPORT_EX report);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct DS4_TOUCH
+    {
+        public byte bPacketCounter;
+        public byte bIsUpTrackingNum1;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public byte[] bTouchData1;
+
+        public byte bIsUpTrackingNum2;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public byte[] bTouchData2;
+
+        public static DS4_TOUCH Empty()
+        {
+            return new DS4_TOUCH
+            {
+                bPacketCounter = 0,
+                bIsUpTrackingNum1 = 0x80,
+                bTouchData1 = new byte[3],
+                bIsUpTrackingNum2 = 0x80,
+                bTouchData2 = new byte[3]
+            };
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct DS4_REPORT_EX
+    {
+        public byte bThumbLX;
+        public byte bThumbLY;
+        public byte bThumbRX;
+        public byte bThumbRY;
+
+        public ushort wButtons;
+
+        public byte bSpecial;
+        public byte bTriggerL;
+        public byte bTriggerR;
+
+        public ushort wTimestamp;
+
+        public byte bBatteryLvl;
+
+        public short wGyroX;
+        public short wGyroY;
+        public short wGyroZ;
+
+        public short wAccelX;
+        public short wAccelY;
+        public short wAccelZ;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 5)]
+        public byte[] Unknown1;
+
+        public byte bBatteryLvlSpecial;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
+        public byte[] Unknown2;
+
+        public byte bTouchPacketsN;
+
+        public DS4_TOUCH sCurrentTouch;
+        public DS4_TOUCH sPreviousTouch1;
+        public DS4_TOUCH sPreviousTouch2;
+
+        public static DS4_REPORT_EX Create()
+        {
+            return new DS4_REPORT_EX
+            {
+                bThumbLX = 128,
+                bThumbLY = 128,
+                bThumbRX = 128,
+                bThumbRY = 128,
+
+                wButtons = 8,
+
+                bBatteryLvl = 0xFF,
+
+                Unknown1 = new byte[5],
+
+                bBatteryLvlSpecial = 0x1A,
+
+                Unknown2 = new byte[2],
+
+                bTouchPacketsN = 1,
+
+                sCurrentTouch = DS4_TOUCH.Empty(),
+                sPreviousTouch1 = DS4_TOUCH.Empty(),
+                sPreviousTouch2 = DS4_TOUCH.Empty()
+            };
+        }
+    }
+}
+
+internal sealed class Bridge : IDisposable
 {
     const int Port = 26760;
+
     const uint Version = 1001;
 
     const uint MsgVersion = 0x00100000;
     const uint MsgPorts   = 0x00100001;
     const uint MsgPad     = 0x00100002;
 
-    static readonly UdpClient udp = new();
-    static IPEndPoint portal = null!;
-    static readonly uint id = (uint)Random.Shared.Next(1, int.MaxValue);
+    readonly UdpClient udp = new();
 
-    // We compare individual bytes and aligned/unaligned Float32 values.
-    // Packet length observed on your Odin/AndroidDSU = 100 bytes.
-    const int ScanStart = 60;
-    const int ScanEnd = 99;
+    readonly IPEndPoint portal;
 
-    sealed class Capture
+    readonly IntPtr client;
+    readonly IntPtr target;
+
+    readonly uint id =
+        (uint)Random.Shared.Next(1, int.MaxValue);
+
+    ushort timestamp;
+
+    long lastPrint;
+    long lastSubscribe;
+
+    public Bridge(string ip)
     {
-        public string Name = "";
-        public readonly List<byte[]> Packets = new();
+        portal =
+            new IPEndPoint(
+                IPAddress.Parse(ip),
+                Port);
+
+        client = Vigem.vigem_alloc();
+
+        if (client == IntPtr.Zero)
+            throw new Exception(
+                "vigem_alloc failed");
+
+        uint error =
+            Vigem.vigem_connect(client);
+
+        if (error != Vigem.Success)
+            throw new Exception(
+                "ViGEm connect failed: 0x" +
+                error.ToString("X8"));
+
+        target =
+            Vigem.vigem_target_ds4_alloc();
+
+        if (target == IntPtr.Zero)
+            throw new Exception(
+                "DS4 allocation failed");
+
+        error =
+            Vigem.vigem_target_add(
+                client,
+                target);
+
+        if (error != Vigem.Success)
+            throw new Exception(
+                "DS4 target_add failed: 0x" +
+                error.ToString("X8"));
     }
 
-    static void Main(string[] args)
+    public void Run()
     {
-        Console.Clear();
-
-        Console.WriteLine("============================================================");
-        Console.WriteLine(" Odin 2 Portal DSU Gyro AXIS FINDER v9 - TIMEOUT FIX");
-        Console.WriteLine("============================================================");
-        Console.WriteLine();
-
-        string ip;
-
-        if (args.Length > 0)
-            ip = args[0];
-        else
-        {
-            Console.Write("Portal IP (e.g. 192.168.1.108): ");
-            ip = Console.ReadLine() ?? "";
-        }
-
-        try
-        {
-            portal = new IPEndPoint(IPAddress.Parse(ip.Trim()), Port);
-
-            Console.WriteLine();
-            Console.WriteLine($"Portal DSU: {portal.Address}:{Port}");
-            Console.WriteLine();
-
-            Subscribe();
-
-            Console.WriteLine("Waiting for AndroidDSU packet...");
-
-            byte[] first = ReceivePad();
-
-            Console.WriteLine($"DSU packet received. Length = {first.Length} bytes");
-            Console.WriteLine();
-
-            Console.WriteLine("IMPORTANT:");
-            Console.WriteLine("During each movement phase move ONLY in the requested way.");
-            Console.WriteLine("Move continuously back and forth for the whole test.");
-            Console.WriteLine();
-
-            WaitEnter("Press ENTER to start.");
-
-            // --------------------------------------------------------
-            // PHASE 0 - STILL
-            // --------------------------------------------------------
-
-            Console.Clear();
-            Header("PHASE 0 / BASELINE - KEEP ODIN COMPLETELY STILL");
-
-            Console.WriteLine();
-            Console.WriteLine("Put Odin flat on a table.");
-            Console.WriteLine("DO NOT TOUCH IT.");
-            Console.WriteLine();
-
-            Countdown();
-
-            Capture still = CapturePackets("STILL", 6);
-
-            // --------------------------------------------------------
-            // PHASE 1
-            // --------------------------------------------------------
-
-            Console.Clear();
-            Header("PHASE 1 - LEFT / RIGHT TILT");
-
-            Console.WriteLine();
-            Console.WriteLine("Hold the Odin normally in front of you.");
-            Console.WriteLine();
-            Console.WriteLine("Tilt it repeatedly:");
-            Console.WriteLine();
-            Console.WriteLine("        LEFT  <---->  RIGHT");
-            Console.WriteLine();
-            Console.WriteLine("Like tilting a steering wheel.");
-            Console.WriteLine();
-            Console.WriteLine("Do NOT move forward/backward if possible.");
-            Console.WriteLine();
-
-            WaitEnter("Press ENTER when ready.");
-
-            Countdown();
-
-            Capture leftRight = CapturePackets("LEFT-RIGHT", 8);
-
-            // --------------------------------------------------------
-            // PHASE 2
-            // --------------------------------------------------------
-
-            Console.Clear();
-            Header("PHASE 2 - FORWARD / BACKWARD TILT");
-
-            Console.WriteLine();
-            Console.WriteLine("Now repeatedly tilt the top edge of the Odin");
-            Console.WriteLine("toward you and away from you.");
-            Console.WriteLine();
-            Console.WriteLine("       FORWARD  <---->  BACKWARD");
-            Console.WriteLine();
-            Console.WriteLine("Try not to roll left/right.");
-            Console.WriteLine();
-
-            WaitEnter("Press ENTER when ready.");
-
-            Countdown();
-
-            Capture forwardBack = CapturePackets("FORWARD-BACK", 8);
-
-            // --------------------------------------------------------
-            // PHASE 3
-            // --------------------------------------------------------
-
-            Console.Clear();
-            Header("PHASE 3 - FLAT ROTATION / YAW");
-
-            Console.WriteLine();
-            Console.WriteLine("Keep the Odin approximately FLAT.");
-            Console.WriteLine();
-            Console.WriteLine("Rotate it repeatedly like this:");
-            Console.WriteLine();
-            Console.WriteLine("       COUNTER-CLOCKWISE <----> CLOCKWISE");
-            Console.WriteLine();
-            Console.WriteLine("Imagine turning it on a table.");
-            Console.WriteLine();
-
-            WaitEnter("Press ENTER when ready.");
-
-            Countdown();
-
-            Capture yaw = CapturePackets("YAW", 8);
-
-            // --------------------------------------------------------
-            // ANALYSIS
-            // --------------------------------------------------------
-
-            Console.Clear();
-
-            Header("ANALYSIS");
-
-            Console.WriteLine();
-            Console.WriteLine($"STILL packets       : {still.Packets.Count}");
-            Console.WriteLine($"LEFT-RIGHT packets  : {leftRight.Packets.Count}");
-            Console.WriteLine($"FORWARD-BACK packets: {forwardBack.Packets.Count}");
-            Console.WriteLine($"YAW packets         : {yaw.Packets.Count}");
-            Console.WriteLine();
-
-            AnalyzeBytes(still, leftRight, forwardBack, yaw);
-
-            Console.WriteLine();
-            Console.WriteLine();
-            AnalyzeFloat32(still, leftRight, forwardBack, yaw);
-
-            Console.WriteLine();
-            Console.WriteLine();
-            PrintLastPacketFloats(yaw);
-
-            Console.WriteLine();
-            Console.WriteLine("============================================================");
-            Console.WriteLine(" TEST COMPLETE");
-            Console.WriteLine("============================================================");
-            Console.WriteLine();
-            Console.WriteLine("Take clear photos of:");
-            Console.WriteLine();
-            Console.WriteLine("  1. TOP BYTE AXIS CANDIDATES");
-            Console.WriteLine("  2. TOP FLOAT32 AXIS CANDIDATES");
-            Console.WriteLine("  3. LAST PACKET FLOAT32 VALUES");
-            Console.WriteLine();
-            Console.WriteLine("Send those photos to ChatGPT.");
-            Console.WriteLine();
-            Console.WriteLine("Press ENTER to exit.");
-            Console.ReadLine();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine();
-            Console.WriteLine("ERROR:");
-            Console.WriteLine(ex);
-            Console.WriteLine();
-            Console.WriteLine("Press ENTER.");
-            Console.ReadLine();
-        }
-    }
-
-    static void Header(string text)
-    {
-        Console.WriteLine("============================================================");
-        Console.WriteLine($" {text}");
-        Console.WriteLine("============================================================");
-    }
-
-    static void WaitEnter(string text)
-    {
-        Console.WriteLine(text);
-        Console.ReadLine();
-    }
-
-    static void Countdown()
-    {
-        Console.WriteLine();
-        Console.WriteLine("Starting in:");
-
-        for (int i = 3; i >= 1; i--)
-        {
-            Console.WriteLine($"{i}...");
-            Thread.Sleep(1000);
-        }
-
-        Console.WriteLine();
-        Console.WriteLine(">>> GO <<<");
-        Console.WriteLine();
-    }
-
-    static Capture CapturePackets(string name, int seconds)
-    {
-        var c = new Capture { Name = name };
-
-        long start = Environment.TickCount64;
-        long end = start + seconds * 1000L;
-        long lastPrint = start;
-        long lastSubscribe = 0;
-
-        // Timed phases must never wait forever inside udp.Receive().
-        // Refresh DSU registration too, because some servers expire it.
-        while (true)
-        {
-            long now = Environment.TickCount64;
-            if (now >= end)
-                break;
-
-            if (now - lastSubscribe >= 1000)
-            {
-                Subscribe();
-                lastSubscribe = now;
-            }
-
-            if (TryReceivePad(50, out byte[]? p) && p != null)
-                c.Packets.Add((byte[])p.Clone());
-
-            now = Environment.TickCount64;
-            if (now - lastPrint >= 1000)
-            {
-                double elapsed = Math.Min(seconds, (now - start) / 1000.0);
-                Console.WriteLine(
-                    $"{name,-14}  Time: {elapsed,5:F1}s / {seconds}s   Packets: {c.Packets.Count}");
-                lastPrint = now;
-            }
-        }
+        Console.WriteLine(
+            "==============================================");
 
         Console.WriteLine(
-            $"{name,-14}  Time: {seconds,5:F1}s / {seconds}s   Packets: {c.Packets.Count}");
+            " ODIN DSU -> VIRTUAL DS4 MOTION BRIDGE v10");
+
+        Console.WriteLine(
+            "==============================================");
+
         Console.WriteLine();
-        Console.WriteLine($"{name} finished: {c.Packets.Count} packets");
-        Thread.Sleep(800);
-        return c;
-    }
 
-    // ------------------------------------------------------------
-    // BYTE ANALYSIS
-    // ------------------------------------------------------------
+        Console.WriteLine(
+            "DSU source : " +
+            portal.Address +
+            ":" +
+            Port);
 
-    sealed class ByteResult
-    {
-        public int Offset;
+        Console.WriteLine(
+            "Virtual DS4: READY");
 
-        public double StillVar;
-        public double LRVar;
-        public double FBVar;
-        public double YawVar;
-
-        public int StillRange;
-        public int LRRange;
-        public int FBRange;
-        public int YawRange;
-
-        public double LRScore;
-        public double FBScore;
-        public double YawScore;
-    }
-
-    static void AnalyzeBytes(
-        Capture still,
-        Capture lr,
-        Capture fb,
-        Capture yaw)
-    {
-        Header("TOP BYTE AXIS CANDIDATES");
-
-        var results = new List<ByteResult>();
-
-        int maxLength = new[]
-        {
-            MaxPacketLength(still),
-            MaxPacketLength(lr),
-            MaxPacketLength(fb),
-            MaxPacketLength(yaw)
-        }.Min();
-
-        int end = Math.Min(ScanEnd, maxLength - 1);
-
-        for (int off = ScanStart; off <= end; off++)
-        {
-            double sv = ByteVariance(still, off);
-            double lv = ByteVariance(lr, off);
-            double fv = ByteVariance(fb, off);
-            double yv = ByteVariance(yaw, off);
-
-            int sr = ByteRange(still, off);
-            int lrr = ByteRange(lr, off);
-            int fbr = ByteRange(fb, off);
-            int yr = ByteRange(yaw, off);
-
-            // A useful gyro byte should change much more during one
-            // movement than when stationary.
-            double baseline = sv + 0.05;
-
-            results.Add(new ByteResult
-            {
-                Offset = off,
-
-                StillVar = sv,
-                LRVar = lv,
-                FBVar = fv,
-                YawVar = yv,
-
-                StillRange = sr,
-                LRRange = lrr,
-                FBRange = fbr,
-                YawRange = yr,
-
-                LRScore = lv / baseline,
-                FBScore = fv / baseline,
-                YawScore = yv / baseline
-            });
-        }
-
-        PrintByteAxis("LEFT / RIGHT", results, x => x.LRScore, x => x.LRVar, x => x.LRRange);
-        PrintByteAxis("FORWARD / BACK", results, x => x.FBScore, x => x.FBVar, x => x.FBRange);
-        PrintByteAxis("YAW / ROTATION", results, x => x.YawScore, x => x.YawVar, x => x.YawRange);
-    }
-
-    static void PrintByteAxis(
-        string name,
-        List<ByteResult> results,
-        Func<ByteResult, double> score,
-        Func<ByteResult, double> moveVar,
-        Func<ByteResult, int> moveRange)
-    {
         Console.WriteLine();
-        Console.WriteLine($"--- {name} ---");
 
-        foreach (var r in results
-            .OrderByDescending(score)
-            .Take(10))
-        {
-            Console.WriteLine(
-                $"BYTE {r.Offset,2} | " +
-                $"score {score(r),10:F2} | " +
-                $"stillVar {r.StillVar,8:F2} | " +
-                $"moveVar {moveVar(r),8:F2} | " +
-                $"stillRange {r.StillRange,3} | " +
-                $"moveRange {moveRange(r),3}");
-        }
-    }
+        Console.WriteLine(
+            "DSU layout:");
 
-    // ------------------------------------------------------------
-    // FLOAT ANALYSIS
-    // ------------------------------------------------------------
+        Console.WriteLine(
+            "Accel = Float32 @ 76 / 80 / 84");
 
-    sealed class FloatResult
-    {
-        public int Offset;
+        Console.WriteLine(
+            "Gyro  = Float32 @ 88 / 92 / 96");
 
-        public double StillRange;
-        public double LRRange;
-        public double FBRange;
-        public double YawRange;
-
-        public double StillVar;
-        public double LRVar;
-        public double FBVar;
-        public double YawVar;
-
-        public double LRScore;
-        public double FBScore;
-        public double YawScore;
-
-        public int StillValid;
-        public int LRValid;
-        public int FBValid;
-        public int YawValid;
-    }
-
-    static void AnalyzeFloat32(
-        Capture still,
-        Capture lr,
-        Capture fb,
-        Capture yaw)
-    {
-        Header("TOP FLOAT32 AXIS CANDIDATES");
-
-        var results = new List<FloatResult>();
-
-        int maxLength = new[]
-        {
-            MaxPacketLength(still),
-            MaxPacketLength(lr),
-            MaxPacketLength(fb),
-            MaxPacketLength(yaw)
-        }.Min();
-
-        int end = Math.Min(96, maxLength - 4);
-
-        // Intentionally scan EVERY byte offset, not only multiples of four.
-        // This catches unaligned Float32 fields.
-        for (int off = ScanStart; off <= end; off++)
-        {
-            var s = FloatStats(still, off);
-            var l = FloatStats(lr, off);
-            var f = FloatStats(fb, off);
-            var y = FloatStats(yaw, off);
-
-            if (s.Valid < 20 ||
-                l.Valid < 20 ||
-                f.Valid < 20 ||
-                y.Valid < 20)
-                continue;
-
-            double baseVar = s.Variance + 0.000001;
-
-            results.Add(new FloatResult
-            {
-                Offset = off,
-
-                StillRange = s.Range,
-                LRRange = l.Range,
-                FBRange = f.Range,
-                YawRange = y.Range,
-
-                StillVar = s.Variance,
-                LRVar = l.Variance,
-                FBVar = f.Variance,
-                YawVar = y.Variance,
-
-                StillValid = s.Valid,
-                LRValid = l.Valid,
-                FBValid = f.Valid,
-                YawValid = y.Valid,
-
-                LRScore = SafeScore(l.Variance, baseVar),
-                FBScore = SafeScore(f.Variance, baseVar),
-                YawScore = SafeScore(y.Variance, baseVar)
-            });
-        }
-
-        PrintFloatAxis(
-            "LEFT / RIGHT",
-            results,
-            x => x.LRScore,
-            x => x.LRRange,
-            x => x.LRVar);
-
-        PrintFloatAxis(
-            "FORWARD / BACK",
-            results,
-            x => x.FBScore,
-            x => x.FBRange,
-            x => x.FBVar);
-
-        PrintFloatAxis(
-            "YAW / ROTATION",
-            results,
-            x => x.YawScore,
-            x => x.YawRange,
-            x => x.YawVar);
-    }
-
-    static void PrintFloatAxis(
-        string name,
-        List<FloatResult> results,
-        Func<FloatResult, double> score,
-        Func<FloatResult, double> moveRange,
-        Func<FloatResult, double> moveVar)
-    {
         Console.WriteLine();
-        Console.WriteLine($"--- {name} ---");
 
-        foreach (var r in results
-            .Where(x =>
-                IsReasonable(x.StillRange) &&
-                IsReasonable(moveRange(x)))
-            .OrderByDescending(score)
-            .Take(12))
-        {
-            Console.WriteLine(
-                $"FLOAT @{r.Offset,2} | " +
-                $"score {score(r),12:F2} | " +
-                $"stillRange {r.StillRange,12:G6} | " +
-                $"moveRange {moveRange(r),12:G6} | " +
-                $"stillVar {r.StillVar,12:G6} | " +
-                $"moveVar {moveVar(r),12:G6}");
-        }
-    }
+        Console.WriteLine(
+            "Move Odin. Values below MUST change.");
 
-    static bool IsReasonable(double x)
-    {
-        return !double.IsNaN(x) &&
-               !double.IsInfinity(x) &&
-               x >= 0 &&
-               x < 1e9;
-    }
+        Console.WriteLine();
 
-    static double SafeScore(double move, double baseline)
-    {
-        double x = move / baseline;
+        Subscribe();
 
-        if (double.IsNaN(x))
-            return 0;
-
-        if (double.IsPositiveInfinity(x))
-            return double.MaxValue;
-
-        return x;
-    }
-
-    // ------------------------------------------------------------
-    // LAST PACKET VIEW
-    // ------------------------------------------------------------
-
-    static void PrintLastPacketFloats(Capture c)
-    {
-        Header("LAST PACKET FLOAT32 VALUES");
-
-        if (c.Packets.Count == 0)
-            return;
-
-        byte[] p = c.Packets[^1];
-
-        for (int off = ScanStart; off <= Math.Min(96, p.Length - 4); off++)
-        {
-            float v = BitConverter.ToSingle(p, off);
-
-            if (!float.IsFinite(v))
-                continue;
-
-            // Hide ridiculous interpretations.
-            if (Math.Abs(v) > 1_000_000)
-                continue;
-
-            Console.WriteLine($"FLOAT @{off,2} = {v,14:F6}");
-        }
-    }
-
-    // ------------------------------------------------------------
-    // STATISTICS
-    // ------------------------------------------------------------
-
-    static int MaxPacketLength(Capture c)
-    {
-        if (c.Packets.Count == 0)
-            return 0;
-
-        return c.Packets.Min(x => x.Length);
-    }
-
-    static double ByteVariance(Capture c, int off)
-    {
-        var vals = c.Packets
-            .Where(p => p.Length > off)
-            .Select(p => (double)p[off])
-            .ToArray();
-
-        return Variance(vals);
-    }
-
-    static int ByteRange(Capture c, int off)
-    {
-        var vals = c.Packets
-            .Where(p => p.Length > off)
-            .Select(p => (int)p[off])
-            .ToArray();
-
-        if (vals.Length == 0)
-            return 0;
-
-        return vals.Max() - vals.Min();
-    }
-
-    readonly struct Stats
-    {
-        public readonly double Variance;
-        public readonly double Range;
-        public readonly int Valid;
-
-        public Stats(double variance, double range, int valid)
-        {
-            Variance = variance;
-            Range = range;
-            Valid = valid;
-        }
-    }
-
-    static Stats FloatStats(Capture c, int off)
-    {
-        var values = new List<double>();
-
-        foreach (byte[] p in c.Packets)
-        {
-            if (off + 4 > p.Length)
-                continue;
-
-            float v = BitConverter.ToSingle(p, off);
-
-            if (!float.IsFinite(v))
-                continue;
-
-            // Reject absurd interpretations caused by starting inside
-            // another field. Keep a generous range for unknown units.
-            if (Math.Abs(v) > 1_000_000)
-                continue;
-
-            values.Add(v);
-        }
-
-        if (values.Count < 2)
-            return new Stats(0, 0, values.Count);
-
-        double[] a = values.ToArray();
-
-        return new Stats(
-            Variance(a),
-            a.Max() - a.Min(),
-            a.Length);
-    }
-
-    static double Variance(double[] a)
-    {
-        if (a.Length < 2)
-            return 0;
-
-        double mean = a.Average();
-
-        double sum = 0;
-
-        foreach (double x in a)
-        {
-            double d = x - mean;
-            sum += d * d;
-        }
-
-        return sum / a.Length;
-    }
-
-    // ------------------------------------------------------------
-    // DSU
-    // ------------------------------------------------------------
-
-    static void Subscribe()
-    {
-        Send(MsgVersion, new byte[]
-        {
-            0xE9, 0x03
-        });
-
-        Send(MsgPorts, new byte[]
-        {
-            0x01, 0x00, 0x00, 0x00, 0x00
-        });
-
-        Send(MsgPad, new byte[8]);
-    }
-
-    static byte[] ReceivePad()
-    {
         while (true)
         {
-            IPEndPoint remote = new(IPAddress.Any, 0);
+            if (Environment.TickCount64 -
+                lastSubscribe > 1000)
+            {
+                Send(MsgPad, new byte[8]);
 
-            byte[] p = udp.Receive(ref remote);
+                lastSubscribe =
+                    Environment.TickCount64;
+            }
 
-            if (p.Length < 20)
+            IPEndPoint remote =
+                new IPEndPoint(
+                    IPAddress.Any,
+                    0);
+
+            byte[] p =
+                udp.Receive(ref remote);
+
+            if (p.Length < 100)
                 continue;
 
             if (p[0] != (byte)'D' ||
@@ -717,110 +273,414 @@ internal static class Program
                 continue;
 
             uint type =
-                BinaryPrimitives.ReadUInt32LittleEndian(
-                    p.AsSpan(16, 4));
+                BinaryPrimitives
+                    .ReadUInt32LittleEndian(
+                        p.AsSpan(16, 4));
 
             if (type != MsgPad)
                 continue;
 
-            return p;
+            if (p[21] != 2)
+                continue;
+
+            float ax =
+                BitConverter.ToSingle(p, 76);
+
+            float ay =
+                BitConverter.ToSingle(p, 80);
+
+            float az =
+                BitConverter.ToSingle(p, 84);
+
+            float gx =
+                BitConverter.ToSingle(p, 88);
+
+            float gy =
+                BitConverter.ToSingle(p, 92);
+
+            float gz =
+                BitConverter.ToSingle(p, 96);
+
+            var report =
+                Vigem.DS4_REPORT_EX.Create();
+
+            // ------------------------------------------------
+            // Controller state
+            // ------------------------------------------------
+
+            report.bThumbLX = p[40];
+            report.bThumbLY = p[41];
+            report.bThumbRX = p[42];
+            report.bThumbRY = p[43];
+
+            CopyButtons(p, ref report);
+
+            // ------------------------------------------------
+            // DS4 timestamp
+            //
+            // DS4 commonly updates around 800 Hz.
+            // Incrementing continuously is important for
+            // motion consumers.
+            // ------------------------------------------------
+
+            timestamp += 188;
+
+            report.wTimestamp =
+                timestamp;
+
+            // ------------------------------------------------
+            // MOTION
+            //
+            // AndroidDSU gyro = degrees/sec
+            //
+            // DS4:
+            // 16 raw units = 1 degree/sec
+            //
+            // AndroidDSU accel values observed are in g.
+            //
+            // DS4:
+            // 8192 raw units = 1 g
+            // ------------------------------------------------
+
+            report.wGyroX =
+                ToShort(gx * 16.0);
+
+            report.wGyroY =
+                ToShort(gy * 16.0);
+
+            report.wGyroZ =
+                ToShort(gz * 16.0);
+
+            report.wAccelX =
+                ToShort(ax * 8192.0);
+
+            report.wAccelY =
+                ToShort(ay * 8192.0);
+
+            report.wAccelZ =
+                ToShort(az * 8192.0);
+
+            uint error =
+                Vigem.vigem_target_ds4_update_ex(
+                    client,
+                    target,
+                    report);
+
+            if (error != Vigem.Success)
+            {
+                throw new Exception(
+                    "DS4 update failed: 0x" +
+                    error.ToString("X8"));
+            }
+
+            if (Environment.TickCount64 -
+                lastPrint >= 250)
+            {
+                Console.WriteLine(
+                    $"GYRO dps " +
+                    $"X={gx,8:F2} " +
+                    $"Y={gy,8:F2} " +
+                    $"Z={gz,8:F2}   |   " +
+                    $"DS4 RAW " +
+                    $"X={report.wGyroX,6} " +
+                    $"Y={report.wGyroY,6} " +
+                    $"Z={report.wGyroZ,6}");
+
+                lastPrint =
+                    Environment.TickCount64;
+            }
         }
     }
 
-    static bool TryReceivePad(int timeoutMs, out byte[]? packet)
+    static void CopyButtons(
+        byte[] p,
+        ref Vigem.DS4_REPORT_EX report)
     {
-        packet = null;
-        long deadline = Environment.TickCount64 + timeoutMs;
+        byte b1 = p[36];
+        byte b2 = p[37];
 
-        while (Environment.TickCount64 < deadline)
-        {
-            // Socket.Poll timeout is in microseconds.
-            if (!udp.Client.Poll(10_000, SelectMode.SelectRead))
-                continue;
+        bool left =
+            (b1 & 0x80) != 0;
 
-            IPEndPoint remote = new(IPAddress.Any, 0);
-            byte[] p = udp.Receive(ref remote);
+        bool down =
+            (b1 & 0x40) != 0;
 
-            if (p.Length < 20)
-                continue;
+        bool right =
+            (b1 & 0x20) != 0;
 
-            if (p[0] != (byte)'D' ||
-                p[1] != (byte)'S' ||
-                p[2] != (byte)'U' ||
-                p[3] != (byte)'S')
-                continue;
+        bool up =
+            (b1 & 0x10) != 0;
 
-            uint type = BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(16, 4));
-            if (type != MsgPad)
-                continue;
+        ushort dpad = 8;
 
-            packet = p;
-            return true;
-        }
+        if (up && right)
+            dpad = 1;
+        else if (right && down)
+            dpad = 3;
+        else if (down && left)
+            dpad = 5;
+        else if (left && up)
+            dpad = 7;
+        else if (up)
+            dpad = 0;
+        else if (right)
+            dpad = 2;
+        else if (down)
+            dpad = 4;
+        else if (left)
+            dpad = 6;
 
-        return false;
+        ushort buttons = dpad;
+
+        if ((b2 & 0x01) != 0)
+            buttons |= 0x0080;
+
+        if ((b2 & 0x02) != 0)
+            buttons |= 0x0040;
+
+        if ((b2 & 0x04) != 0)
+            buttons |= 0x0020;
+
+        if ((b2 & 0x08) != 0)
+            buttons |= 0x0010;
+
+        if ((b2 & 0x10) != 0)
+            buttons |= 0x0200;
+
+        if ((b2 & 0x20) != 0)
+            buttons |= 0x0100;
+
+        if ((b2 & 0x40) != 0)
+            buttons |= 0x0800;
+
+        if ((b2 & 0x80) != 0)
+            buttons |= 0x0400;
+
+        report.wButtons =
+            buttons;
+
+        byte special = 0;
+
+        if (p[38] != 0)
+            special |= 0x01;
+
+        if (p[39] != 0)
+            special |= 0x08;
+
+        report.bSpecial =
+            special;
+
+        report.bTriggerL =
+            p[35];
+
+        report.bTriggerR =
+            p[34];
     }
 
-    static void Send(uint type, byte[] payload)
+    static short ToShort(double value)
     {
-        byte[] p = new byte[20 + payload.Length];
+        return (short)Math.Clamp(
+            Math.Round(value),
+            short.MinValue,
+            short.MaxValue);
+    }
+
+    void Subscribe()
+    {
+        Send(
+            MsgVersion,
+            new byte[]
+            {
+                0xE9,
+                0x03
+            });
+
+        Send(
+            MsgPorts,
+            new byte[]
+            {
+                0x01,
+                0x00,
+                0x00,
+                0x00,
+                0x00
+            });
+
+        Send(
+            MsgPad,
+            new byte[8]);
+
+        lastSubscribe =
+            Environment.TickCount64;
+    }
+
+    void Send(
+        uint type,
+        byte[] payload)
+    {
+        byte[] p =
+            new byte[
+                20 +
+                payload.Length];
 
         p[0] = (byte)'D';
         p[1] = (byte)'S';
         p[2] = (byte)'U';
         p[3] = (byte)'C';
 
-        BinaryPrimitives.WriteUInt16LittleEndian(
-            p.AsSpan(4, 2),
-            (ushort)Version);
+        BinaryPrimitives
+            .WriteUInt16LittleEndian(
+                p.AsSpan(4, 2),
+                (ushort)Version);
 
-        BinaryPrimitives.WriteUInt16LittleEndian(
-            p.AsSpan(6, 2),
-            (ushort)(4 + payload.Length));
+        BinaryPrimitives
+            .WriteUInt16LittleEndian(
+                p.AsSpan(6, 2),
+                (ushort)(
+                    4 +
+                    payload.Length));
 
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            p.AsSpan(8, 4),
-            0);
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(8, 4),
+                0);
 
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            p.AsSpan(12, 4),
-            id);
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(12, 4),
+                id);
 
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            p.AsSpan(16, 4),
-            type);
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(16, 4),
+                type);
 
-        payload.CopyTo(p, 20);
+        payload.CopyTo(
+            p,
+            20);
 
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            p.AsSpan(8, 4),
-            Crc32(p));
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(8, 4),
+                Crc32(p));
 
-        udp.Send(p, p.Length, portal);
+        udp.Send(
+            p,
+            p.Length,
+            portal);
     }
 
     static uint Crc32(byte[] b)
     {
-        uint crc = 0xFFFFFFFF;
+        uint crc =
+            0xFFFFFFFF;
 
-        for (int i = 0; i < b.Length; i++)
+        for (int i = 0;
+             i < b.Length;
+             i++)
         {
             byte x =
-                (i >= 8 && i < 12)
-                ? (byte)0
-                : b[i];
+                (i >= 8 &&
+                 i < 12)
+                    ? (byte)0
+                    : b[i];
 
             crc ^= x;
 
-            for (int j = 0; j < 8; j++)
+            for (int j = 0;
+                 j < 8;
+                 j++)
             {
                 crc =
                     (crc >> 1) ^
                     (0xEDB88320u &
-                    (uint)-(int)(crc & 1));
+                    (uint)-(int)(
+                        crc & 1));
             }
         }
 
         return ~crc;
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (target != IntPtr.Zero)
+                Vigem.vigem_target_remove(
+                    client,
+                    target);
+        }
+        catch { }
+
+        try
+        {
+            if (target != IntPtr.Zero)
+                Vigem.vigem_target_free(
+                    target);
+        }
+        catch { }
+
+        try
+        {
+            if (client != IntPtr.Zero)
+                Vigem.vigem_disconnect(
+                    client);
+        }
+        catch { }
+
+        try
+        {
+            if (client != IntPtr.Zero)
+                Vigem.vigem_free(
+                    client);
+        }
+        catch { }
+
+        udp.Dispose();
+    }
+}
+
+internal static class Program
+{
+    static void Main(string[] args)
+    {
+        Console.WriteLine(
+            "Odin DSU -> Virtual DS4 Motion Bridge v10");
+
+        Console.WriteLine();
+
+        string ip =
+            args.Length > 0
+                ? args[0]
+                : "";
+
+        if (string.IsNullOrWhiteSpace(ip))
+        {
+            Console.Write(
+                "Portal IP (e.g. 192.168.1.108): ");
+
+            ip =
+                Console.ReadLine() ?? "";
+        }
+
+        try
+        {
+            using var bridge =
+                new Bridge(ip.Trim());
+
+            bridge.Run();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine();
+            Console.WriteLine("ERROR:");
+            Console.WriteLine(ex);
+            Console.WriteLine();
+            Console.WriteLine(
+                "Press ENTER to exit.");
+
+            Console.ReadLine();
+        }
     }
 }
