@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 
 internal static class Vigem
 {
@@ -113,6 +114,7 @@ internal sealed class Bridge : IDisposable
             int.MaxValue);
 
     ushort timestamp;
+    long lastReportTicks = Stopwatch.GetTimestamp();
 
     long lastPrint;
     long lastSubscribe;
@@ -171,7 +173,7 @@ internal sealed class Bridge : IDisposable
             "============================================================");
 
         Console.WriteLine(
-            " ODIN 2 PORTAL DSU -> VIRTUAL DS4 BRIDGE v11 RAW63");
+            " ODIN 2 PORTAL DSU -> VIRTUAL DS4 BRIDGE v12 STEAM-MOTION");
 
         Console.WriteLine(
             "============================================================");
@@ -345,7 +347,22 @@ internal sealed class Bridge : IDisposable
             // TIMESTAMP
             // ========================================================
 
-            timestamp += 188;
+            // Real DS4 timestamp: one unit is approximately 5.333 us.
+            long nowTicks = Stopwatch.GetTimestamp();
+            double elapsedSeconds =
+                (nowTicks - lastReportTicks) /
+                (double)Stopwatch.Frequency;
+
+            int timestampDelta =
+                (int)Math.Round(elapsedSeconds / 0.000005333);
+
+            timestampDelta =
+                Math.Clamp(timestampDelta, 1, 18750);
+
+            timestamp =
+                unchecked((ushort)(timestamp + timestampDelta));
+
+            lastReportTicks = nowTicks;
 
             WriteU16(
                 r,
@@ -362,17 +379,16 @@ internal sealed class Bridge : IDisposable
             // 16 raw units = 1 degree/sec
             // ========================================================
 
+            // DS4 scale = 16 raw units per degree/sec.
+            // Inverse ViGEm calibration, matching Sunshine/Apollo.
             short gyroX =
-                ToShort(
-                    gx * 16.0);
+                ToShort(((gx * 16.0) + 1.0) / 0.977596);
 
             short gyroY =
-                ToShort(
-                    gy * 16.0);
+                ToShort((gy * 16.0) / 0.972370);
 
             short gyroZ =
-                ToShort(
-                    gz * 16.0);
+                ToShort((gz * 16.0) / 0.971550);
 
             WriteI16(
                 r,
@@ -399,17 +415,16 @@ internal sealed class Bridge : IDisposable
             // 8192 raw units = 1 g
             // ========================================================
 
+            // AndroidDSU values here are approximately g.
+            // DS4 scale = 8192 raw units per g, with inverse ViGEm calibration.
             short accelX =
-                ToShort(
-                    ax * 8192.0);
+                ToShort(((ax * 8192.0) - 297.0) / 1.010796);
 
             short accelY =
-                ToShort(
-                    ay * 8192.0);
+                ToShort(((ay * 8192.0) - 42.0) / 1.014614);
 
             short accelZ =
-                ToShort(
-                    az * 8192.0);
+                ToShort(((az * 8192.0) - 512.0) / 1.024768);
 
             WriteI16(
                 r,
@@ -457,7 +472,9 @@ internal sealed class Bridge : IDisposable
                     $"DS4 RAW " +
                     $"X={gyroX,6} " +
                     $"Y={gyroY,6} " +
-                    $"Z={gyroZ,6}");
+                    $"Z={gyroZ,6} " +
+                    $"TS={timestamp,5} " +
+                    $"dTS={timestampDelta,5}");
 
                 lastPrint =
                     Environment.TickCount64;
@@ -807,7 +824,7 @@ internal static class Program
         string[] args)
     {
         Console.WriteLine(
-            "Odin 2 Portal DSU -> Virtual DS4 Bridge v11 RAW63");
+            "Odin 2 Portal DSU -> Virtual DS4 Bridge v12 STEAM-MOTION");
 
         Console.WriteLine();
 
