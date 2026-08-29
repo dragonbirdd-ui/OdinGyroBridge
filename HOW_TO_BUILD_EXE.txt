@@ -1,0 +1,43 @@
+# BUILD THIS ON GITHUB — 3 steps
+
+1. Create a new empty GitHub repository.
+2. Upload ALL files/folders from this ZIP, including the hidden `.github` folder.
+3. Open the repository's **Actions** tab -> **Build OdinGyroBridge EXE** -> **Run workflow**.
+
+After the build finishes:
+- Open the successful workflow run.
+- Scroll to **Artifacts**.
+- Download **OdinGyroBridge-Windows-x64**.
+- Extract it to get `OdinGyroBridge.exe`.
+
+## Important runtime dependency
+
+The EXE is self-contained for .NET, so the target PC does NOT need the .NET SDK/runtime.
+
+However, the current bridge uses the ViGEm native API. Windows therefore still needs:
+- ViGEmBus driver installed
+- a compatible x64 `ViGEmClient.dll` available to the EXE at runtime
+
+GitHub Actions cannot legally/reliably invent that native DLL. This ZIP intentionally does not bundle third-party binaries.
+
+## Run
+
+Start AndroidDSU on Odin 2 Portal, then run:
+
+    OdinGyroBridge.exe
+
+Enter the Portal IP shown in AndroidDSU, e.g.:
+
+    192.168.1.108
+
+Expected console:
+
+    Virtual DualShock 4: READY
+    Waiting for AndroidDSU packets...
+
+and then changing gyro/accel values when packets are received.
+
+## Caveat
+
+This is still an untested prototype for the exact Odin 2 Portal + AndroidDSU combination.
+GitHub Actions proves it compiles on Windows; it does not prove the hardware/protocol behavior is correct.
