@@ -239,7 +239,7 @@ internal sealed class Bridge : IDisposable
     {
         byte[] p = new byte[20 + payload.Length];
         p[0] = (byte)'D'; p[1] = (byte)'S'; p[2] = (byte)'U'; p[3] = (byte)'C';
-        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(4, 2), Version);
+        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(4, 2), (ushort)Version);
         BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(6, 2), (ushort)(4 + payload.Length));
         BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(8, 4), 0);
         BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(12, 4), id);
