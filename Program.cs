@@ -1,4 +1,5 @@
 
+
 using System;
 using System.Buffers.Binary;
 using System.Net;
@@ -35,48 +36,17 @@ internal static class Vigem
 
     [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern uint vigem_target_ds4_update_ex(
-        IntPtr client, IntPtr target, ref DS4_REPORT_EX report);
+        IntPtr client, IntPtr target, DS4_REPORT_EX report);
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public struct DS4_REPORT_EX
     {
-        public byte bThumbLX;
-        public byte bThumbLY;
-        public byte bThumbRX;
-        public byte bThumbRY;
-        public ushort wButtons;
-        public byte bSpecial;
-        public byte bTriggerL;
-        public byte bTriggerR;
-        public ushort wTimestamp;
-        public byte bBatteryLvl;
-        public short wGyroX;
-        public short wGyroY;
-        public short wGyroZ;
-        public short wAccelX;
-        public short wAccelY;
-        public short wAccelZ;
-        public byte unknown1_0;
-        public byte unknown1_1;
-        public byte unknown1_2;
-        public byte unknown1_3;
-        public byte unknown1_4;
-        public byte bBatteryLvlSpecial;
-        public byte unknown2_0;
-        public byte unknown2_1;
-        public byte bTouchPacketsN;
-
-        // 10 bytes touch structures (3 + 1 + 3 + 1?).
-        // We only need a correctly sized 63-byte report.
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 31)]
-        public byte[] TouchAndTail;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 63)]
+        public byte[] Report;
 
         public static DS4_REPORT_EX Create()
         {
-            return new DS4_REPORT_EX
-            {
-                TouchAndTail = new byte[31]
-            };
+            return new DS4_REPORT_EX { Report = new byte[63] };
         }
     }
 }
@@ -159,11 +129,10 @@ internal sealed class Bridge : IDisposable
             float gz = BitConverter.ToSingle(p, 96);
 
             var r = Vigem.DS4_REPORT_EX.Create();
-            r.bThumbLX = lx; r.bThumbLY = ly;
-            r.bThumbRX = rx; r.bThumbRY = ry;
+            byte[] q = r.Report;
 
-            // DS4 D-pad encoding is a nibble:
-            // 0=N,1=NE,2=E,3=SE,4=S,5=SW,6=W,7=NW,8=neutral.
+            q[0] = lx; q[1] = ly; q[2] = rx; q[3] = ry;
+
             bool left  = (b1 & 0x80) != 0;
             bool down  = (b1 & 0x40) != 0;
             bool right = (b1 & 0x20) != 0;
@@ -179,54 +148,59 @@ internal sealed class Bridge : IDisposable
             else if (left) d = 6;
 
             ushort buttons = (ushort)d;
+            if ((b2 & 0x01) != 0) buttons |= 0x0080;
+            if ((b2 & 0x02) != 0) buttons |= 0x0040;
+            if ((b2 & 0x04) != 0) buttons |= 0x0020;
+            if ((b2 & 0x08) != 0) buttons |= 0x0010;
+            if ((b2 & 0x10) != 0) buttons |= 0x0200;
+            if ((b2 & 0x20) != 0) buttons |= 0x0100;
+            if ((b2 & 0x40) != 0) buttons |= 0x0800;
+            if ((b2 & 0x80) != 0) buttons |= 0x0400;
+            BinaryPrimitives.WriteUInt16LittleEndian(q.AsSpan(4, 2), buttons);
 
-            // DSU byte 2: Y B A X R1 L1 R2 L2.
-            if ((b2 & 0x01) != 0) buttons |= 0x0080; // Y -> Triangle
-            if ((b2 & 0x02) != 0) buttons |= 0x0040; // B -> Circle
-            if ((b2 & 0x04) != 0) buttons |= 0x0020; // A -> Cross
-            if ((b2 & 0x08) != 0) buttons |= 0x0010; // X -> Square
-            if ((b2 & 0x10) != 0) buttons |= 0x0200; // R1
-            if ((b2 & 0x20) != 0) buttons |= 0x0100; // L1
-            if ((b2 & 0x40) != 0) buttons |= 0x0800; // R2 digital
-            if ((b2 & 0x80) != 0) buttons |= 0x0400; // L2 digital
-
-            r.wButtons = buttons;
-
-            // DS4 special: L3, R3, Share, Options, PS, Touchpad.
             byte special = 0;
-            if ((b1 & 0x02) != 0) special |= 0x02; // L3
-            if ((b1 & 0x04) != 0) special |= 0x04; // R3
-            if ((b1 & 0x01) != 0) special |= 0x10; // Share
-            if ((b1 & 0x08) != 0) special |= 0x20; // Options
-            if (home != 0) special |= 0x01;         // PS
-            if (touch != 0) special |= 0x08;        // Touchpad
-            r.bSpecial = special;
+            if ((b1 & 0x02) != 0) special |= 0x02;
+            if ((b1 & 0x04) != 0) special |= 0x04;
+            if ((b1 & 0x01) != 0) special |= 0x10;
+            if ((b1 & 0x08) != 0) special |= 0x20;
+            if (home != 0) special |= 0x01;
+            if (touch != 0) special |= 0x08;
+            q[6] = special;
+            q[7] = p[35];
+            q[8] = p[34];
 
-            // Analog trigger values from DSU. Non-analog games still see digital flags above.
-            r.bTriggerL = p[35];
-            r.bTriggerR = p[34];
+            ushort ts = (ushort)(Environment.TickCount & 0xFFFF);
+            BinaryPrimitives.WriteUInt16LittleEndian(q.AsSpan(9, 2), ts);
+            q[11] = 0x1B;
 
-            r.wTimestamp = (ushort)(Environment.TickCount & 0xFFFF);
-            r.bBatteryLvl = 0xFF;
+            short rawGx = ToI16(gx * 16.0);
+            short rawGy = ToI16(gy * 16.0);
+            short rawGz = ToI16(gz * 16.0);
+            short rawAx = ToI16(ax * 8192.0);
+            short rawAy = ToI16(ay * 8192.0);
+            short rawAz = ToI16(az * 8192.0);
 
-            // ViGEm DS4 extended report: gyro and accel are signed 16-bit.
-            // DS4/ViGEm uses gyro in roughly 16 counts per deg/s and accel in 8192 counts/g.
-            r.wGyroX = ToI16(gx * 16.0);
-            r.wGyroY = ToI16(gy * 16.0);
-            r.wGyroZ = ToI16(gz * 16.0);
-            r.wAccelX = ToI16(ax * 8192.0);
-            r.wAccelY = ToI16(ay * 8192.0);
-            r.wAccelZ = ToI16(az * 8192.0);
+            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(12, 2), rawGx);
+            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(14, 2), rawGy);
+            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(16, 2), rawGz);
+            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(18, 2), rawAx);
+            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(20, 2), rawAy);
+            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(22, 2), rawAz);
 
-            var err = Vigem.vigem_target_ds4_update_ex(client, target, ref r);
+            q[32] = 1;
+            q[33] = (byte)(Environment.TickCount & 0xFF);
+            q[34] = 0x80;
+            q[38] = 0x80;
+
+            var err = Vigem.vigem_target_ds4_update_ex(client, target, r);
             if (err != Vigem.Success)
                 throw new Exception($"ViGEm update failed: 0x{err:X8}");
 
             if (Environment.TickCount64 - last > 1000)
             {
                 Console.WriteLine(
-                    $"DSU OK  | gyro {gx,8:F2} {gy,8:F2} {gz,8:F2} dps | " +
-                    $"accel {ax,6:F2} {ay,6:F2} {az,6:F2} g");
+                    $"DSU gyro {gx,8:F2} {gy,8:F2} {gz,8:F2} dps | " +
+                    $"RAW DS4 {rawGx,6} {rawGy,6} {rawGz,6} | ViGEm OK");
                 last = Environment.TickCount64;
             }
         }
@@ -276,7 +250,7 @@ static class Program
 {
     static void Main(string[] args)
     {
-        Console.WriteLine("Odin 2 Portal DSU -> Virtual DS4 bridge v2");
+        Console.WriteLine("Odin 2 Portal DSU -> Virtual DS4 bridge v3 RAW63");
         Console.WriteLine();
 
         string ip = args.Length > 0 ? args[0] : "";
