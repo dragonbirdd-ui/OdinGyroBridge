@@ -1,760 +1,176 @@
+
 using System;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Diagnostics;
+using System.Text;
 using System.Threading;
 
-internal static class Vigem
+class Program
 {
-    public const uint Success = 0x20000000;
+    const int PORT = 26760;
+    const uint VERSION = 1001;
+    const uint MSG_VERSION = 0x00100000;
+    const uint MSG_PORTS   = 0x00100001;
+    const uint MSG_PAD     = 0x00100002;
 
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr vigem_alloc();
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT { public uint type; public MOUSEINPUT mi; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct MOUSEINPUT {
+        public int dx, dy;
+        public uint mouseData, dwFlags, time;
+        public UIntPtr dwExtraInfo;
+    }
+    [DllImport("user32.dll", SetLastError=true)]
+    static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void vigem_free(IntPtr client);
+    const uint INPUT_MOUSE = 0;
+    const uint MOUSEEVENTF_MOVE = 0x0001;
 
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_connect(IntPtr client);
+    static volatile float gx, gy, gz;
+    static volatile bool haveData = false;
+    static volatile bool running = true;
 
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void vigem_disconnect(IntPtr client);
+    // Easy tuning: raise for faster mouse, lower for slower.
+    static double sensitivity = 0.22;
+    static double deadzoneDps = 0.35;
 
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr vigem_target_ds4_alloc();
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void vigem_target_free(IntPtr target);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_target_add(
-        IntPtr client,
-        IntPtr target);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_target_remove(
-        IntPtr client,
-        IntPtr target);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_target_ds4_update_ex(
-        IntPtr client,
-        IntPtr target,
-        DS4_REPORT_EX report);
-
-    // Raw 63-byte DS4_REPORT_EX.
-    // This avoids nested C# struct-marshalling ambiguity.
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    public struct DS4_REPORT_EX
+    static uint Crc32(byte[] data, int offset, int count)
     {
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 63)]
-        public byte[] Report;
-
-        public static DS4_REPORT_EX Create()
-        {
-            var r = new DS4_REPORT_EX
-            {
-                Report = new byte[63]
-            };
-
-            // Analog sticks centered
-            r.Report[0] = 128; // LX
-            r.Report[1] = 128; // LY
-            r.Report[2] = 128; // RX
-            r.Report[3] = 128; // RY
-
-            // D-pad neutral
-            r.Report[4] = 8;
-
-            // Battery
-            r.Report[11] = 0xFF;
-
-            // Battery / connection information
-            r.Report[29] = 0x1A;
-
-            // Touch packet count
-            r.Report[32] = 1;
-
-            // Touch fingers UP
-            r.Report[34] = 0x80;
-            r.Report[38] = 0x80;
-
-            r.Report[43] = 0x80;
-            r.Report[47] = 0x80;
-
-            r.Report[52] = 0x80;
-            r.Report[56] = 0x80;
-
-            return r;
+        uint crc = 0xffffffff;
+        for (int i = offset; i < offset + count; i++) {
+            crc ^= data[i];
+            for (int j=0; j<8; j++)
+                crc = (crc >> 1) ^ (0xEDB88320u & (uint)-(int)(crc & 1));
         }
-    }
-}
-
-internal sealed class Bridge : IDisposable
-{
-    const int Port = 26760;
-
-    const uint Version = 1001;
-
-    const uint MsgVersion = 0x00100000;
-    const uint MsgPorts   = 0x00100001;
-    const uint MsgPad     = 0x00100002;
-
-    readonly UdpClient udp = new();
-
-    readonly IPEndPoint portal;
-
-    readonly IntPtr client;
-    readonly IntPtr target;
-
-    readonly uint id =
-        (uint)Random.Shared.Next(
-            1,
-            int.MaxValue);
-
-    ushort timestamp;
-    long lastPrint;
-    long lastSubscribe;
-
-    readonly object packetLock = new();
-    byte[]? latestPacket;
-    volatile bool running = true;
-
-    public Bridge(string ip)
-    {
-        portal =
-            new IPEndPoint(
-                IPAddress.Parse(ip),
-                Port);
-
-        client =
-            Vigem.vigem_alloc();
-
-        if (client == IntPtr.Zero)
-        {
-            throw new Exception(
-                "ViGEmClient.dll: vigem_alloc failed.");
-        }
-
-        uint error =
-            Vigem.vigem_connect(client);
-
-        if (error != Vigem.Success)
-        {
-            throw new Exception(
-                $"ViGEm connect failed: 0x{error:X8}");
-        }
-
-        target =
-            Vigem.vigem_target_ds4_alloc();
-
-        if (target == IntPtr.Zero)
-        {
-            throw new Exception(
-                "vigem_target_ds4_alloc failed.");
-        }
-
-        error =
-            Vigem.vigem_target_add(
-                client,
-                target);
-
-        if (error != Vigem.Success)
-        {
-            throw new Exception(
-                $"ViGEm target_add failed: 0x{error:X8}");
-        }
-    }
-
-    public void Run()
-    {
-        Console.Clear();
-
-        Console.WriteLine(
-            "============================================================");
-
-        Console.WriteLine(
-            " ODIN 2 PORTAL DSU -> VIRTUAL DS4 BRIDGE v13 STEAM-MOTION-100HZ");
-
-        Console.WriteLine(
-            "============================================================");
-
-        Console.WriteLine();
-
-        Console.WriteLine(
-            $"Portal DSU : {portal.Address}:{Port}");
-
-        Console.WriteLine(
-            "Virtual DS4: READY");
-
-        Console.WriteLine();
-
-        Console.WriteLine(
-            "DSU ACCEL:");
-
-        Console.WriteLine(
-            "  X @76");
-
-        Console.WriteLine(
-            "  Y @80");
-
-        Console.WriteLine(
-            "  Z @84");
-
-        Console.WriteLine();
-
-        Console.WriteLine(
-            "DSU GYRO:");
-
-        Console.WriteLine(
-            "  X @88");
-
-        Console.WriteLine(
-            "  Y @92");
-
-        Console.WriteLine(
-            "  Z @96");
-
-        Console.WriteLine();
-
-        Console.WriteLine(
-            "Move Odin - GYRO and DS4 RAW values must change.");
-
-        Console.WriteLine();
-
-        Subscribe();
-
-        // v13: receive DSU packets independently, but feed the virtual DS4
-        // at a stable 100 Hz. Steam/Sunshine/Apollo motion paths expect
-        // periodic motion reports; tying DS4 updates to irregular UDP arrival
-        // produced highly variable timestamp deltas in v12.
-        var rxThread = new Thread(ReceiveLoop)
-        {
-            IsBackground = true,
-            Name = "AndroidDSU Receiver"
-        };
-        rxThread.Start();
-
-        const int reportPeriodMs = 10; // 100 Hz
-        const ushort timestampStep = 1875; // 10 ms / ~5.333 us
-
-        var clock = Stopwatch.StartNew();
-        long nextTick = clock.ElapsedTicks;
-
-        while (true)
-        {
-            // Refresh AndroidDSU subscription every second.
-            if (Environment.TickCount64 - lastSubscribe >= 1000)
-            {
-                Send(MsgPad, new byte[8]);
-                lastSubscribe = Environment.TickCount64;
-            }
-
-            byte[]? p;
-            lock (packetLock)
-            {
-                p = latestPacket;
-            }
-
-            if (p != null)
-            {
-                float ax = BitConverter.ToSingle(p, 76);
-                float ay = BitConverter.ToSingle(p, 80);
-                float az = BitConverter.ToSingle(p, 84);
-                float gx = BitConverter.ToSingle(p, 88);
-                float gy = BitConverter.ToSingle(p, 92);
-                float gz = BitConverter.ToSingle(p, 96);
-
-                if (float.IsFinite(ax) && float.IsFinite(ay) &&
-                    float.IsFinite(az) && float.IsFinite(gx) &&
-                    float.IsFinite(gy) && float.IsFinite(gz))
-                {
-                    Vigem.DS4_REPORT_EX report = Vigem.DS4_REPORT_EX.Create();
-                    byte[] r = report.Report;
-
-                    r[0] = p[40];
-                    r[1] = p[41];
-                    r[2] = p[42];
-                    r[3] = p[43];
-                    CopyButtonsRaw(p, r);
-
-                    // Stable DS4 timestamp for stable 100 Hz output.
-                    timestamp = unchecked((ushort)(timestamp + timestampStep));
-                    WriteU16(r, 9, timestamp);
-
-                    // DS4: 16 raw units = 1 degree/sec.
-                    short gyroX = ToShort(((gx * 16.0) + 1.0) / 0.977596);
-                    short gyroY = ToShort((gy * 16.0) / 0.972370);
-                    short gyroZ = ToShort((gz * 16.0) / 0.971550);
-
-                    WriteI16(r, 12, gyroX);
-                    WriteI16(r, 14, gyroY);
-                    WriteI16(r, 16, gyroZ);
-
-                    // DS4 accelerometer: 8192 raw units = 1 g.
-                    short accelX = ToShort(((ax * 8192.0) - 297.0) / 1.010796);
-                    short accelY = ToShort(((ay * 8192.0) - 42.0) / 1.014614);
-                    short accelZ = ToShort(((az * 8192.0) - 512.0) / 1.024768);
-
-                    WriteI16(r, 18, accelX);
-                    WriteI16(r, 20, accelY);
-                    WriteI16(r, 22, accelZ);
-
-                    uint error = Vigem.vigem_target_ds4_update_ex(client, target, report);
-                    if (error != Vigem.Success)
-                        throw new Exception($"ViGEm DS4 update failed: 0x{error:X8}");
-
-                    if (Environment.TickCount64 - lastPrint >= 250)
-                    {
-                        Console.WriteLine(
-                            $"GYRO dps X={gx,8:F2} Y={gy,8:F2} Z={gz,8:F2}   |   " +
-                            $"DS4 RAW X={gyroX,6} Y={gyroY,6} Z={gyroZ,6} " +
-                            $"TS={timestamp,5} dTS={timestampStep,4} RATE=100Hz");
-                        lastPrint = Environment.TickCount64;
-                    }
-                }
-            }
-
-            nextTick += Stopwatch.Frequency * reportPeriodMs / 1000;
-            while (true)
-            {
-                long remaining = nextTick - clock.ElapsedTicks;
-                if (remaining <= 0) break;
-
-                double ms = remaining * 1000.0 / Stopwatch.Frequency;
-                if (ms > 1.5)
-                    Thread.Sleep(1);
-                else
-                    Thread.SpinWait(100);
-            }
-        }
-    }
-
-    void ReceiveLoop()
-    {
-        while (running)
-        {
-            try
-            {
-                IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
-                byte[] p = udp.Receive(ref remote);
-
-                if (p.Length < 100)
-                    continue;
-
-                if (p[0] != (byte)'D' || p[1] != (byte)'S' ||
-                    p[2] != (byte)'U' || p[3] != (byte)'S')
-                    continue;
-
-                uint type = BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(16, 4));
-                if (type != MsgPad || p[21] != 2)
-                    continue;
-
-                lock (packetLock)
-                {
-                    latestPacket = p;
-                }
-            }
-            catch (ObjectDisposedException)
-            {
-                return;
-            }
-            catch (SocketException)
-            {
-                if (!running) return;
-            }
-        }
-    }
-
-    static void CopyButtonsRaw(
-        byte[] p,
-        byte[] r)
-    {
-        byte b1 =
-            p[36];
-
-        byte b2 =
-            p[37];
-
-        // ============================================================
-        // DPAD
-        // ============================================================
-
-        bool left =
-            (b1 & 0x80) != 0;
-
-        bool down =
-            (b1 & 0x40) != 0;
-
-        bool right =
-            (b1 & 0x20) != 0;
-
-        bool up =
-            (b1 & 0x10) != 0;
-
-        ushort dpad = 8;
-
-        if (up && right)
-            dpad = 1;
-
-        else if (right && down)
-            dpad = 3;
-
-        else if (down && left)
-            dpad = 5;
-
-        else if (left && up)
-            dpad = 7;
-
-        else if (up)
-            dpad = 0;
-
-        else if (right)
-            dpad = 2;
-
-        else if (down)
-            dpad = 4;
-
-        else if (left)
-            dpad = 6;
-
-        ushort buttons =
-            dpad;
-
-        // ============================================================
-        // FACE / SHOULDER BUTTONS
-        // ============================================================
-
-        if ((b2 & 0x01) != 0)
-            buttons |= 0x0080;
-
-        if ((b2 & 0x02) != 0)
-            buttons |= 0x0040;
-
-        if ((b2 & 0x04) != 0)
-            buttons |= 0x0020;
-
-        if ((b2 & 0x08) != 0)
-            buttons |= 0x0010;
-
-        if ((b2 & 0x10) != 0)
-            buttons |= 0x0200;
-
-        if ((b2 & 0x20) != 0)
-            buttons |= 0x0100;
-
-        if ((b2 & 0x40) != 0)
-            buttons |= 0x0800;
-
-        if ((b2 & 0x80) != 0)
-            buttons |= 0x0400;
-
-        WriteU16(
-            r,
-            4,
-            buttons);
-
-        // ============================================================
-        // PS / TOUCHPAD
-        // ============================================================
-
-        byte special = 0;
-
-        if (p[38] != 0)
-            special |= 0x01;
-
-        if (p[39] != 0)
-            special |= 0x08;
-
-        r[6] =
-            special;
-
-        // ============================================================
-        // ANALOG TRIGGERS
-        // ============================================================
-
-        r[7] =
-            p[35];
-
-        r[8] =
-            p[34];
-    }
-
-    static short ToShort(
-        double value)
-    {
-        return (short)Math.Clamp(
-            Math.Round(value),
-            short.MinValue,
-            short.MaxValue);
-    }
-
-    static void WriteI16(
-        byte[] buffer,
-        int offset,
-        short value)
-    {
-        BinaryPrimitives
-            .WriteInt16LittleEndian(
-                buffer.AsSpan(
-                    offset,
-                    2),
-                value);
-    }
-
-    static void WriteU16(
-        byte[] buffer,
-        int offset,
-        ushort value)
-    {
-        BinaryPrimitives
-            .WriteUInt16LittleEndian(
-                buffer.AsSpan(
-                    offset,
-                    2),
-                value);
-    }
-
-    // ================================================================
-    // ANDROID DSU SUBSCRIPTION
-    // ================================================================
-
-    void Subscribe()
-    {
-        Send(
-            MsgVersion,
-            new byte[]
-            {
-                0xE9,
-                0x03
-            });
-
-        Send(
-            MsgPorts,
-            new byte[]
-            {
-                0x01,
-                0x00,
-                0x00,
-                0x00,
-                0x00
-            });
-
-        Send(
-            MsgPad,
-            new byte[8]);
-
-        lastSubscribe =
-            Environment.TickCount64;
-    }
-
-    void Send(
-        uint type,
-        byte[] payload)
-    {
-        byte[] p =
-            new byte[
-                20 +
-                payload.Length];
-
-        // DSUC
-        p[0] = (byte)'D';
-        p[1] = (byte)'S';
-        p[2] = (byte)'U';
-        p[3] = (byte)'C';
-
-        BinaryPrimitives
-            .WriteUInt16LittleEndian(
-                p.AsSpan(4, 2),
-                (ushort)Version);
-
-        BinaryPrimitives
-            .WriteUInt16LittleEndian(
-                p.AsSpan(6, 2),
-                (ushort)(
-                    4 +
-                    payload.Length));
-
-        // CRC temporarily zero
-        BinaryPrimitives
-            .WriteUInt32LittleEndian(
-                p.AsSpan(8, 4),
-                0);
-
-        BinaryPrimitives
-            .WriteUInt32LittleEndian(
-                p.AsSpan(12, 4),
-                id);
-
-        BinaryPrimitives
-            .WriteUInt32LittleEndian(
-                p.AsSpan(16, 4),
-                type);
-
-        payload.CopyTo(
-            p,
-            20);
-
-        // Calculate CRC
-        BinaryPrimitives
-            .WriteUInt32LittleEndian(
-                p.AsSpan(8, 4),
-                Crc32(p));
-
-        udp.Send(
-            p,
-            p.Length,
-            portal);
-    }
-
-    static uint Crc32(
-        byte[] b)
-    {
-        uint crc =
-            0xFFFFFFFF;
-
-        for (int i = 0;
-             i < b.Length;
-             i++)
-        {
-            byte x =
-                (i >= 8 &&
-                 i < 12)
-                    ? (byte)0
-                    : b[i];
-
-            crc ^=
-                x;
-
-            for (int j = 0;
-                 j < 8;
-                 j++)
-            {
-                crc =
-                    (crc >> 1) ^
-                    (
-                        0xEDB88320u &
-                        (uint)-(int)(
-                            crc & 1)
-                    );
-            }
-        }
-
         return ~crc;
     }
 
-    // ================================================================
-    // CLEANUP
-    // ================================================================
-
-    public void Dispose()
+    static byte[] MakeRequest(uint msgType, byte[] payload)
     {
-        running = false;
-        try { udp.Close(); } catch { }
-
-        try
-        {
-            if (target != IntPtr.Zero)
-            {
-                Vigem.vigem_target_remove(
-                    client,
-                    target);
-            }
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            if (target != IntPtr.Zero)
-            {
-                Vigem.vigem_target_free(
-                    target);
-            }
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            if (client != IntPtr.Zero)
-            {
-                Vigem.vigem_disconnect(
-                    client);
-            }
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            if (client != IntPtr.Zero)
-            {
-                Vigem.vigem_free(
-                    client);
-            }
-        }
-        catch
-        {
-        }
-
-        udp.Dispose();
+        payload ??= Array.Empty<byte>();
+        byte[] p = new byte[20 + payload.Length];
+        Encoding.ASCII.GetBytes("DSUC").CopyTo(p, 0);
+        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(4,2), (ushort)VERSION);
+        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(6,2), (ushort)(payload.Length + 4));
+        // CRC at 8..11 remains zero during CRC calculation
+        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(12,4), 0x12345678);
+        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(16,4), msgType);
+        payload.CopyTo(p,20);
+        uint crc = Crc32(p, 0, p.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(8,4), crc);
+        return p;
     }
-}
 
-internal static class Program
-{
-    static void Main(
-        string[] args)
+    static float F32(byte[] p, int o)
     {
-        Console.WriteLine(
-            "Odin 2 Portal DSU -> Virtual DS4 Bridge v13 STEAM-MOTION-100HZ");
+        int bits = BinaryPrimitives.ReadInt32LittleEndian(p.AsSpan(o,4));
+        return BitConverter.Int32BitsToSingle(bits);
+    }
 
+    static void Receiver()
+    {
+        using UdpClient udp = new UdpClient(PORT);
+        udp.Client.ReceiveTimeout = 1000;
+        IPEndPoint any = new IPEndPoint(IPAddress.Any, 0);
+
+        DateTime lastSubscribe = DateTime.MinValue;
+        IPEndPoint android = null;
+
+        Console.WriteLine("Listening for AndroidDSU on UDP 26760...");
+        Console.WriteLine("Open AndroidDSU and keep its DSU server enabled.");
+
+        while (running)
+        {
+            try {
+                byte[] p = udp.Receive(ref any);
+
+                // Remember sender so we can refresh subscription.
+                android = new IPEndPoint(any.Address, any.Port);
+
+                if (p.Length >= 100 &&
+                    p[0]=='D' && p[1]=='S' && p[2]=='U' && p[3]=='S' &&
+                    BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(16,4)) == MSG_PAD &&
+                    p[21] == 2)
+                {
+                    // AndroidDSU / DSUS standard layout used by our prior bridge:
+                    // accel 76/80/84, gyro 88/92/96.
+                    gx = F32(p,88);
+                    gy = F32(p,92);
+                    gz = F32(p,96);
+                    haveData = true;
+                }
+
+                if (android != null && (DateTime.UtcNow-lastSubscribe).TotalMilliseconds > 900)
+                {
+                    // Subscribe to all pads.
+                    byte[] req = MakeRequest(MSG_PAD, new byte[8]);
+                    udp.Send(req, req.Length, android);
+                    lastSubscribe = DateTime.UtcNow;
+                }
+            }
+            catch (SocketException) { }
+            catch (Exception ex) { Console.WriteLine("RX: " + ex.Message); }
+        }
+    }
+
+    static void MoveMouse(int dx, int dy)
+    {
+        if (dx == 0 && dy == 0) return;
+        INPUT[] inp = new INPUT[1];
+        inp[0].type = INPUT_MOUSE;
+        inp[0].mi.dx = dx;
+        inp[0].mi.dy = dy;
+        inp[0].mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, inp, Marshal.SizeOf<INPUT>());
+    }
+
+    static void Main(string[] args)
+    {
+        Console.Title = "Odin Gyro -> Windows Mouse";
+        Console.WriteLine("ODIN GYRO -> WINDOWS MOUSE TEST");
+        Console.WriteLine("--------------------------------");
+        Console.WriteLine("No Steam Input / no ViGEm required.");
+        Console.WriteLine("ESC = quit   +/- = sensitivity");
         Console.WriteLine();
 
-        string ip =
-            args.Length > 0
-                ? args[0]
-                : "";
+        Thread rx = new Thread(Receiver) { IsBackground = true };
+        rx.Start();
 
-        if (string.IsNullOrWhiteSpace(ip))
+        double remX=0, remY=0;
+        long lastPrint = Environment.TickCount64;
+
+        while (running)
         {
-            Console.Write(
-                "Portal IP (e.g. 192.168.1.108): ");
+            // For handheld yaw, Z commonly maps to horizontal; X maps to vertical.
+            // If axes feel wrong, this test still proves direct mouse output.
+            double hz = Math.Abs(gz) < deadzoneDps ? 0 : gz;
+            double vx = Math.Abs(gx) < deadzoneDps ? 0 : gx;
 
-            ip =
-                Console.ReadLine() ?? "";
-        }
+            remX += hz * sensitivity;
+            remY += vx * sensitivity;
 
-        try
-        {
-            using var bridge =
-                new Bridge(
-                    ip.Trim());
+            int dx = (int)Math.Truncate(remX);
+            int dy = (int)Math.Truncate(remY);
+            remX -= dx; remY -= dy;
+            MoveMouse(dx, dy);
 
-            bridge.Run();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine();
+            if (Environment.TickCount64 - lastPrint > 250)
+            {
+                Console.Write($"\rGYRO X={gx,7:F2} Y={gy,7:F2} Z={gz,7:F2}  mouse=({dx,3},{dy,3})  sens={sensitivity:F2}   ");
+                lastPrint = Environment.TickCount64;
+            }
 
-            Console.WriteLine(
-                "ERROR:");
-
-            Console.WriteLine(
-                ex);
-
-            Console.WriteLine();
-
-            Console.WriteLine(
-                "Press ENTER to exit...");
-
-            Console.ReadLine();
+            if (Console.KeyAvailable)
+            {
+                var k = Console.ReadKey(true);
+                if (k.Key == ConsoleKey.Escape) running=false;
+                else if (k.KeyChar == '+' || k.Key == ConsoleKey.Add) sensitivity *= 1.25;
+                else if (k.KeyChar == '-' || k.Key == ConsoleKey.Subtract) sensitivity /= 1.25;
+            }
+            Thread.Sleep(10);
         }
     }
 }
