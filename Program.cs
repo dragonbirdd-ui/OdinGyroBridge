@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
+using System.Threading;
 
 internal static class Vigem
 {
@@ -114,10 +115,12 @@ internal sealed class Bridge : IDisposable
             int.MaxValue);
 
     ushort timestamp;
-    long lastReportTicks = Stopwatch.GetTimestamp();
-
     long lastPrint;
     long lastSubscribe;
+
+    readonly object packetLock = new();
+    byte[]? latestPacket;
+    volatile bool running = true;
 
     public Bridge(string ip)
     {
@@ -173,7 +176,7 @@ internal sealed class Bridge : IDisposable
             "============================================================");
 
         Console.WriteLine(
-            " ODIN 2 PORTAL DSU -> VIRTUAL DS4 BRIDGE v12 STEAM-MOTION");
+            " ODIN 2 PORTAL DSU -> VIRTUAL DS4 BRIDGE v13 STEAM-MOTION-100HZ");
 
         Console.WriteLine(
             "============================================================");
@@ -223,261 +226,144 @@ internal sealed class Bridge : IDisposable
 
         Subscribe();
 
+        // v13: receive DSU packets independently, but feed the virtual DS4
+        // at a stable 100 Hz. Steam/Sunshine/Apollo motion paths expect
+        // periodic motion reports; tying DS4 updates to irregular UDP arrival
+        // produced highly variable timestamp deltas in v12.
+        var rxThread = new Thread(ReceiveLoop)
+        {
+            IsBackground = true,
+            Name = "AndroidDSU Receiver"
+        };
+        rxThread.Start();
+
+        const int reportPeriodMs = 10; // 100 Hz
+        const ushort timestampStep = 1875; // 10 ms / ~5.333 us
+
+        var clock = Stopwatch.StartNew();
+        long nextTick = clock.ElapsedTicks;
+
         while (true)
         {
             // Refresh AndroidDSU subscription every second.
-            if (Environment.TickCount64 -
-                lastSubscribe >= 1000)
+            if (Environment.TickCount64 - lastSubscribe >= 1000)
             {
-                Send(
-                    MsgPad,
-                    new byte[8]);
-
-                lastSubscribe =
-                    Environment.TickCount64;
+                Send(MsgPad, new byte[8]);
+                lastSubscribe = Environment.TickCount64;
             }
 
-            IPEndPoint remote =
-                new IPEndPoint(
-                    IPAddress.Any,
-                    0);
-
-            byte[] p =
-                udp.Receive(
-                    ref remote);
-
-            // We need up to offset 99.
-            if (p.Length < 100)
-                continue;
-
-            // DSUS response signature
-            if (p[0] != (byte)'D' ||
-                p[1] != (byte)'S' ||
-                p[2] != (byte)'U' ||
-                p[3] != (byte)'S')
+            byte[]? p;
+            lock (packetLock)
             {
-                continue;
+                p = latestPacket;
             }
 
-            uint type =
-                BinaryPrimitives
-                    .ReadUInt32LittleEndian(
-                        p.AsSpan(16, 4));
-
-            if (type != MsgPad)
-                continue;
-
-            // DSU connected state
-            if (p[21] != 2)
-                continue;
-
-            // ========================================================
-            // READ ANDROID DSU MOTION
-            // ========================================================
-
-            float ax =
-                BitConverter.ToSingle(
-                    p,
-                    76);
-
-            float ay =
-                BitConverter.ToSingle(
-                    p,
-                    80);
-
-            float az =
-                BitConverter.ToSingle(
-                    p,
-                    84);
-
-            float gx =
-                BitConverter.ToSingle(
-                    p,
-                    88);
-
-            float gy =
-                BitConverter.ToSingle(
-                    p,
-                    92);
-
-            float gz =
-                BitConverter.ToSingle(
-                    p,
-                    96);
-
-            // Reject broken packets.
-            if (!float.IsFinite(ax) ||
-                !float.IsFinite(ay) ||
-                !float.IsFinite(az) ||
-                !float.IsFinite(gx) ||
-                !float.IsFinite(gy) ||
-                !float.IsFinite(gz))
+            if (p != null)
             {
-                continue;
+                float ax = BitConverter.ToSingle(p, 76);
+                float ay = BitConverter.ToSingle(p, 80);
+                float az = BitConverter.ToSingle(p, 84);
+                float gx = BitConverter.ToSingle(p, 88);
+                float gy = BitConverter.ToSingle(p, 92);
+                float gz = BitConverter.ToSingle(p, 96);
+
+                if (float.IsFinite(ax) && float.IsFinite(ay) &&
+                    float.IsFinite(az) && float.IsFinite(gx) &&
+                    float.IsFinite(gy) && float.IsFinite(gz))
+                {
+                    Vigem.DS4_REPORT_EX report = Vigem.DS4_REPORT_EX.Create();
+                    byte[] r = report.Report;
+
+                    r[0] = p[40];
+                    r[1] = p[41];
+                    r[2] = p[42];
+                    r[3] = p[43];
+                    CopyButtonsRaw(p, r);
+
+                    // Stable DS4 timestamp for stable 100 Hz output.
+                    timestamp = unchecked((ushort)(timestamp + timestampStep));
+                    WriteU16(r, 9, timestamp);
+
+                    // DS4: 16 raw units = 1 degree/sec.
+                    short gyroX = ToShort(((gx * 16.0) + 1.0) / 0.977596);
+                    short gyroY = ToShort((gy * 16.0) / 0.972370);
+                    short gyroZ = ToShort((gz * 16.0) / 0.971550);
+
+                    WriteI16(r, 12, gyroX);
+                    WriteI16(r, 14, gyroY);
+                    WriteI16(r, 16, gyroZ);
+
+                    // DS4 accelerometer: 8192 raw units = 1 g.
+                    short accelX = ToShort(((ax * 8192.0) - 297.0) / 1.010796);
+                    short accelY = ToShort(((ay * 8192.0) - 42.0) / 1.014614);
+                    short accelZ = ToShort(((az * 8192.0) - 512.0) / 1.024768);
+
+                    WriteI16(r, 18, accelX);
+                    WriteI16(r, 20, accelY);
+                    WriteI16(r, 22, accelZ);
+
+                    uint error = Vigem.vigem_target_ds4_update_ex(client, target, report);
+                    if (error != Vigem.Success)
+                        throw new Exception($"ViGEm DS4 update failed: 0x{error:X8}");
+
+                    if (Environment.TickCount64 - lastPrint >= 250)
+                    {
+                        Console.WriteLine(
+                            $"GYRO dps X={gx,8:F2} Y={gy,8:F2} Z={gz,8:F2}   |   " +
+                            $"DS4 RAW X={gyroX,6} Y={gyroY,6} Z={gyroZ,6} " +
+                            $"TS={timestamp,5} dTS={timestampStep,4} RATE=100Hz");
+                        lastPrint = Environment.TickCount64;
+                    }
+                }
             }
 
-            // ========================================================
-            // CREATE RAW DS4 REPORT
-            // ========================================================
-
-            Vigem.DS4_REPORT_EX report =
-                Vigem.DS4_REPORT_EX.Create();
-
-            byte[] r =
-                report.Report;
-
-            // ========================================================
-            // STICKS
-            // ========================================================
-
-            r[0] = p[40];
-            r[1] = p[41];
-            r[2] = p[42];
-            r[3] = p[43];
-
-            // ========================================================
-            // BUTTONS
-            // ========================================================
-
-            CopyButtonsRaw(
-                p,
-                r);
-
-            // ========================================================
-            // TIMESTAMP
-            // ========================================================
-
-            // Real DS4 timestamp: one unit is approximately 5.333 us.
-            long nowTicks = Stopwatch.GetTimestamp();
-            double elapsedSeconds =
-                (nowTicks - lastReportTicks) /
-                (double)Stopwatch.Frequency;
-
-            int timestampDelta =
-                (int)Math.Round(elapsedSeconds / 0.000005333);
-
-            timestampDelta =
-                Math.Clamp(timestampDelta, 1, 18750);
-
-            timestamp =
-                unchecked((ushort)(timestamp + timestampDelta));
-
-            lastReportTicks = nowTicks;
-
-            WriteU16(
-                r,
-                9,
-                timestamp);
-
-            // ========================================================
-            // GYROSCOPE
-            //
-            // AndroidDSU:
-            // degrees/sec
-            //
-            // DS4:
-            // 16 raw units = 1 degree/sec
-            // ========================================================
-
-            // DS4 scale = 16 raw units per degree/sec.
-            // Inverse ViGEm calibration, matching Sunshine/Apollo.
-            short gyroX =
-                ToShort(((gx * 16.0) + 1.0) / 0.977596);
-
-            short gyroY =
-                ToShort((gy * 16.0) / 0.972370);
-
-            short gyroZ =
-                ToShort((gz * 16.0) / 0.971550);
-
-            WriteI16(
-                r,
-                12,
-                gyroX);
-
-            WriteI16(
-                r,
-                14,
-                gyroY);
-
-            WriteI16(
-                r,
-                16,
-                gyroZ);
-
-            // ========================================================
-            // ACCELEROMETER
-            //
-            // AndroidDSU:
-            // approximately g
-            //
-            // DS4:
-            // 8192 raw units = 1 g
-            // ========================================================
-
-            // AndroidDSU values here are approximately g.
-            // DS4 scale = 8192 raw units per g, with inverse ViGEm calibration.
-            short accelX =
-                ToShort(((ax * 8192.0) - 297.0) / 1.010796);
-
-            short accelY =
-                ToShort(((ay * 8192.0) - 42.0) / 1.014614);
-
-            short accelZ =
-                ToShort(((az * 8192.0) - 512.0) / 1.024768);
-
-            WriteI16(
-                r,
-                18,
-                accelX);
-
-            WriteI16(
-                r,
-                20,
-                accelY);
-
-            WriteI16(
-                r,
-                22,
-                accelZ);
-
-            // ========================================================
-            // SEND REPORT TO VIRTUAL DS4
-            // ========================================================
-
-            uint error =
-                Vigem.vigem_target_ds4_update_ex(
-                    client,
-                    target,
-                    report);
-
-            if (error != Vigem.Success)
+            nextTick += Stopwatch.Frequency * reportPeriodMs / 1000;
+            while (true)
             {
-                throw new Exception(
-                    $"ViGEm DS4 update failed: 0x{error:X8}");
+                long remaining = nextTick - clock.ElapsedTicks;
+                if (remaining <= 0) break;
+
+                double ms = remaining * 1000.0 / Stopwatch.Frequency;
+                if (ms > 1.5)
+                    Thread.Sleep(1);
+                else
+                    Thread.SpinWait(100);
             }
+        }
+    }
 
-            // ========================================================
-            // DEBUG OUTPUT
-            // ========================================================
-
-            if (Environment.TickCount64 -
-                lastPrint >= 250)
+    void ReceiveLoop()
+    {
+        while (running)
+        {
+            try
             {
-                Console.WriteLine(
-                    $"GYRO dps " +
-                    $"X={gx,8:F2} " +
-                    $"Y={gy,8:F2} " +
-                    $"Z={gz,8:F2}   |   " +
-                    $"DS4 RAW " +
-                    $"X={gyroX,6} " +
-                    $"Y={gyroY,6} " +
-                    $"Z={gyroZ,6} " +
-                    $"TS={timestamp,5} " +
-                    $"dTS={timestampDelta,5}");
+                IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+                byte[] p = udp.Receive(ref remote);
 
-                lastPrint =
-                    Environment.TickCount64;
+                if (p.Length < 100)
+                    continue;
+
+                if (p[0] != (byte)'D' || p[1] != (byte)'S' ||
+                    p[2] != (byte)'U' || p[3] != (byte)'S')
+                    continue;
+
+                uint type = BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(16, 4));
+                if (type != MsgPad || p[21] != 2)
+                    continue;
+
+                lock (packetLock)
+                {
+                    latestPacket = p;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+            catch (SocketException)
+            {
+                if (!running) return;
             }
         }
     }
@@ -765,6 +651,9 @@ internal sealed class Bridge : IDisposable
 
     public void Dispose()
     {
+        running = false;
+        try { udp.Close(); } catch { }
+
         try
         {
             if (target != IntPtr.Zero)
@@ -824,7 +713,7 @@ internal static class Program
         string[] args)
     {
         Console.WriteLine(
-            "Odin 2 Portal DSU -> Virtual DS4 Bridge v12 STEAM-MOTION");
+            "Odin 2 Portal DSU -> Virtual DS4 Bridge v13 STEAM-MOTION-100HZ");
 
         Console.WriteLine();
 
