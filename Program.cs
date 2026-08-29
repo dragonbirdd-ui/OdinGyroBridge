@@ -1,5 +1,3 @@
-
-
 using System;
 using System.Buffers.Binary;
 using System.Net;
@@ -36,7 +34,9 @@ internal static class Vigem
 
     [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern uint vigem_target_ds4_update_ex(
-        IntPtr client, IntPtr target, DS4_REPORT_EX report);
+        IntPtr client,
+        IntPtr target,
+        DS4_REPORT_EX report);
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public struct DS4_REPORT_EX
@@ -46,7 +46,10 @@ internal static class Vigem
 
         public static DS4_REPORT_EX Create()
         {
-            return new DS4_REPORT_EX { Report = new byte[63] };
+            return new DS4_REPORT_EX
+            {
+                Report = new byte[63]
+            };
         }
     }
 }
@@ -54,224 +57,654 @@ internal static class Vigem
 internal sealed class Bridge : IDisposable
 {
     const int Port = 26760;
+
     const uint Version = 1001;
     const uint MsgVersion = 0x00100000;
-    const uint MsgPorts = 0x00100001;
-    const uint MsgPad = 0x00100002;
+    const uint MsgPorts   = 0x00100001;
+    const uint MsgPad     = 0x00100002;
 
     readonly UdpClient udp = new();
     readonly IPEndPoint portal;
+
     readonly IntPtr client;
     readonly IntPtr target;
-    readonly uint id = (uint)Random.Shared.Next(1, int.MaxValue);
+
+    readonly uint id =
+        (uint)Random.Shared.Next(1, int.MaxValue);
+
+    // DS4 motion state
+    ushort _ds4Timestamp = 0;
+    long _lastMotionTime = 0;
+    int _touchCounter = 0;
 
     public Bridge(string ip)
     {
-        portal = new IPEndPoint(IPAddress.Parse(ip), Port);
+        portal = new IPEndPoint(
+            IPAddress.Parse(ip),
+            Port);
 
         client = Vigem.vigem_alloc();
-        if (client == IntPtr.Zero) throw new Exception("ViGEmClient.dll: vigem_alloc failed.");
+
+        if (client == IntPtr.Zero)
+            throw new Exception(
+                "ViGEmClient.dll: vigem_alloc failed.");
 
         var e = Vigem.vigem_connect(client);
-        if (e != Vigem.Success) throw new Exception($"ViGEm connect failed: 0x{e:X8}");
+
+        if (e != Vigem.Success)
+            throw new Exception(
+                $"ViGEm connect failed: 0x{e:X8}");
 
         target = Vigem.vigem_target_ds4_alloc();
-        if (target == IntPtr.Zero) throw new Exception("vigem_target_ds4_alloc failed.");
 
-        e = Vigem.vigem_target_add(client, target);
-        if (e != Vigem.Success) throw new Exception($"ViGEm target_add failed: 0x{e:X8}");
+        if (target == IntPtr.Zero)
+            throw new Exception(
+                "vigem_target_ds4_alloc failed.");
+
+        e = Vigem.vigem_target_add(
+            client,
+            target);
+
+        if (e != Vigem.Success)
+            throw new Exception(
+                $"ViGEm target_add failed: 0x{e:X8}");
     }
 
     public void Run()
     {
-        Console.WriteLine($"Portal DSU: {portal.Address}:{Port}");
-        Console.WriteLine("Virtual DualShock 4: READY");
-        Console.WriteLine("Waiting for AndroidDSU packets...");
+        Console.WriteLine(
+            $"Portal DSU: {portal.Address}:{Port}");
+
+        Console.WriteLine(
+            "Virtual DualShock 4: READY");
+
+        Console.WriteLine(
+            "Waiting for AndroidDSU packets...");
+
         Console.WriteLine();
 
-        Send(MsgVersion, new byte[] { 0xE9, 0x03 });
-        Send(MsgPorts, new byte[] { 0x01, 0x00, 0x00, 0x00, 0x00 });
-        Send(MsgPad, new byte[8]);
+        Send(
+            MsgVersion,
+            new byte[] { 0xE9, 0x03 });
+
+        Send(
+            MsgPorts,
+            new byte[]
+            {
+                0x01,
+                0x00,
+                0x00,
+                0x00,
+                0x00
+            });
+
+        Send(
+            MsgPad,
+            new byte[8]);
 
         long last = 0;
+
         while (true)
         {
-            IPEndPoint remote = new(IPAddress.Any, 0);
-            byte[] p = udp.Receive(ref remote);
+            IPEndPoint remote =
+                new(IPAddress.Any, 0);
 
-            if (p.Length < 100) continue;
-            if (p[0] != 'D' || p[1] != 'S' || p[2] != 'U' || p[3] != 'S') continue;
+            byte[] p =
+                udp.Receive(ref remote);
 
-            uint type = BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(16, 4));
-            if (type != MsgPad) continue;
+            if (p.Length < 100)
+                continue;
 
-            // DSU response layout, from the protocol specification:
-            // absolute 20 = slot
+            if (p[0] != 'D' ||
+                p[1] != 'S' ||
+                p[2] != 'U' ||
+                p[3] != 'S')
+                continue;
+
+            uint type =
+                BinaryPrimitives
+                .ReadUInt32LittleEndian(
+                    p.AsSpan(16, 4));
+
+            if (type != MsgPad)
+                continue;
+
+            // DSU packet layout
+            //
+            // 20 = slot
             // 21 = connection state
-            // 36 = buttons byte 1
-            // 37 = buttons byte 2
+            //
+            // 36 = buttons 1
+            // 37 = buttons 2
             // 38 = HOME
             // 39 = touch
+            //
             // 40..43 = sticks
-            // 76..87 = accel
+            //
+            // 76..87 = accelerometer
             // 88..99 = gyro
-            if (p[21] != 2) continue; // connected
 
-            byte b1 = p[36], b2 = p[37];
-            byte home = p[38], touch = p[39];
-            byte lx = p[40], ly = p[41], rx = p[42], ry = p[43];
+            if (p[21] != 2)
+                continue;
 
-            float ax = BitConverter.ToSingle(p, 76);
-            float ay = BitConverter.ToSingle(p, 80);
-            float az = BitConverter.ToSingle(p, 84);
-            float gx = BitConverter.ToSingle(p, 88);
-            float gy = BitConverter.ToSingle(p, 92);
-            float gz = BitConverter.ToSingle(p, 96);
+            byte b1 = p[36];
+            byte b2 = p[37];
 
-            var r = Vigem.DS4_REPORT_EX.Create();
+            byte home  = p[38];
+            byte touch = p[39];
+
+            byte lx = p[40];
+            byte ly = p[41];
+            byte rx = p[42];
+            byte ry = p[43];
+
+            float ax =
+                BitConverter.ToSingle(p, 76);
+
+            float ay =
+                BitConverter.ToSingle(p, 80);
+
+            float az =
+                BitConverter.ToSingle(p, 84);
+
+            float gx =
+                BitConverter.ToSingle(p, 88);
+
+            float gy =
+                BitConverter.ToSingle(p, 92);
+
+            float gz =
+                BitConverter.ToSingle(p, 96);
+
+            var r =
+                Vigem.DS4_REPORT_EX.Create();
+
             byte[] q = r.Report;
 
-            q[0] = lx; q[1] = ly; q[2] = rx; q[3] = ry;
+            // ============================
+            // STICKS
+            // ============================
 
-            bool left  = (b1 & 0x80) != 0;
-            bool down  = (b1 & 0x40) != 0;
-            bool right = (b1 & 0x20) != 0;
-            bool up    = (b1 & 0x10) != 0;
+            q[0] = lx;
+            q[1] = ly;
+            q[2] = rx;
+            q[3] = ry;
+
+            // ============================
+            // DPAD
+            // ============================
+
+            bool left =
+                (b1 & 0x80) != 0;
+
+            bool down =
+                (b1 & 0x40) != 0;
+
+            bool right =
+                (b1 & 0x20) != 0;
+
+            bool up =
+                (b1 & 0x10) != 0;
+
             int d = 8;
-            if (up && right) d = 1;
-            else if (right && down) d = 3;
-            else if (down && left) d = 5;
-            else if (left && up) d = 7;
-            else if (up) d = 0;
-            else if (right) d = 2;
-            else if (down) d = 4;
-            else if (left) d = 6;
 
-            ushort buttons = (ushort)d;
-            if ((b2 & 0x01) != 0) buttons |= 0x0080;
-            if ((b2 & 0x02) != 0) buttons |= 0x0040;
-            if ((b2 & 0x04) != 0) buttons |= 0x0020;
-            if ((b2 & 0x08) != 0) buttons |= 0x0010;
-            if ((b2 & 0x10) != 0) buttons |= 0x0200;
-            if ((b2 & 0x20) != 0) buttons |= 0x0100;
-            if ((b2 & 0x40) != 0) buttons |= 0x0800;
-            if ((b2 & 0x80) != 0) buttons |= 0x0400;
-            BinaryPrimitives.WriteUInt16LittleEndian(q.AsSpan(4, 2), buttons);
+            if (up && right)
+                d = 1;
+
+            else if (right && down)
+                d = 3;
+
+            else if (down && left)
+                d = 5;
+
+            else if (left && up)
+                d = 7;
+
+            else if (up)
+                d = 0;
+
+            else if (right)
+                d = 2;
+
+            else if (down)
+                d = 4;
+
+            else if (left)
+                d = 6;
+
+            // ============================
+            // BUTTONS
+            // ============================
+
+            ushort buttons =
+                (ushort)d;
+
+            if ((b2 & 0x01) != 0)
+                buttons |= 0x0080;
+
+            if ((b2 & 0x02) != 0)
+                buttons |= 0x0040;
+
+            if ((b2 & 0x04) != 0)
+                buttons |= 0x0020;
+
+            if ((b2 & 0x08) != 0)
+                buttons |= 0x0010;
+
+            if ((b2 & 0x10) != 0)
+                buttons |= 0x0200;
+
+            if ((b2 & 0x20) != 0)
+                buttons |= 0x0100;
+
+            if ((b2 & 0x40) != 0)
+                buttons |= 0x0800;
+
+            if ((b2 & 0x80) != 0)
+                buttons |= 0x0400;
+
+            BinaryPrimitives
+                .WriteUInt16LittleEndian(
+                    q.AsSpan(4, 2),
+                    buttons);
+
+            // ============================
+            // SPECIAL BUTTONS
+            // ============================
 
             byte special = 0;
-            if ((b1 & 0x02) != 0) special |= 0x02;
-            if ((b1 & 0x04) != 0) special |= 0x04;
-            if ((b1 & 0x01) != 0) special |= 0x10;
-            if ((b1 & 0x08) != 0) special |= 0x20;
-            if (home != 0) special |= 0x01;
-            if (touch != 0) special |= 0x08;
+
+            if ((b1 & 0x02) != 0)
+                special |= 0x02;
+
+            if ((b1 & 0x04) != 0)
+                special |= 0x04;
+
+            if ((b1 & 0x01) != 0)
+                special |= 0x10;
+
+            if ((b1 & 0x08) != 0)
+                special |= 0x20;
+
+            if (home != 0)
+                special |= 0x01;
+
+            if (touch != 0)
+                special |= 0x08;
+
             q[6] = special;
+
+            // triggers
             q[7] = p[35];
             q[8] = p[34];
 
-            ushort ts = (ushort)(Environment.TickCount & 0xFFFF);
-            BinaryPrimitives.WriteUInt16LittleEndian(q.AsSpan(9, 2), ts);
-            q[11] = 0x1B;
+            // ============================
+            // DS4 TIMESTAMP
+            // ============================
 
-            short rawGx = ToI16(gx * 16.0);
-            short rawGy = ToI16(gy * 16.0);
-            short rawGz = ToI16(gz * 16.0);
-            short rawAx = ToI16(ax * 8192.0);
-            short rawAy = ToI16(ay * 8192.0);
-            short rawAz = ToI16(az * 8192.0);
+            long nowTicks =
+                Environment.TickCount64;
 
-            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(12, 2), rawGx);
-            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(14, 2), rawGy);
-            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(16, 2), rawGz);
-            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(18, 2), rawAx);
-            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(20, 2), rawAy);
-            BinaryPrimitives.WriteInt16LittleEndian(q.AsSpan(22, 2), rawAz);
+            if (_lastMotionTime == 0)
+                _lastMotionTime = nowTicks;
+
+            long elapsedMs =
+                nowTicks - _lastMotionTime;
+
+            _lastMotionTime =
+                nowTicks;
+
+            int increment =
+                (int)Math.Max(
+                    1,
+                    Math.Round(
+                        elapsedMs *
+                        (188.0 / 1.25)));
+
+            _ds4Timestamp =
+                unchecked(
+                    (ushort)(
+                        _ds4Timestamp +
+                        increment));
+
+            BinaryPrimitives
+                .WriteUInt16LittleEndian(
+                    q.AsSpan(9, 2),
+                    _ds4Timestamp);
+
+            // ============================
+            // BATTERY
+            // ============================
+
+            q[11] = 0xFF;
+
+            // ============================
+            // GYRO
+            // AndroidDSU = degrees/sec
+            // DS4 = 16 units / degree/sec
+            // ============================
+
+            short rawGx =
+                ToI16(gx * 16.0);
+
+            short rawGy =
+                ToI16(gy * 16.0);
+
+            short rawGz =
+                ToI16(gz * 16.0);
+
+            BinaryPrimitives
+                .WriteInt16LittleEndian(
+                    q.AsSpan(12, 2),
+                    rawGx);
+
+            BinaryPrimitives
+                .WriteInt16LittleEndian(
+                    q.AsSpan(14, 2),
+                    rawGy);
+
+            BinaryPrimitives
+                .WriteInt16LittleEndian(
+                    q.AsSpan(16, 2),
+                    rawGz);
+
+            // ============================
+            // ACCELEROMETER
+            // AndroidDSU = g
+            // DS4 ~= 8192 units / g
+            // ============================
+
+            short rawAx =
+                ToI16(ax * 8192.0);
+
+            short rawAy =
+                ToI16(ay * 8192.0);
+
+            short rawAz =
+                ToI16(az * 8192.0);
+
+            BinaryPrimitives
+                .WriteInt16LittleEndian(
+                    q.AsSpan(18, 2),
+                    rawAx);
+
+            BinaryPrimitives
+                .WriteInt16LittleEndian(
+                    q.AsSpan(20, 2),
+                    rawAy);
+
+            BinaryPrimitives
+                .WriteInt16LittleEndian(
+                    q.AsSpan(22, 2),
+                    rawAz);
+
+            // bytes 24..28 reserved
+
+            // ============================
+            // BATTERY / CONNECTION STATUS
+            // ============================
+
+            q[29] = 0x1A;
+
+            // ============================
+            // TOUCH PACKETS
+            // ============================
 
             q[32] = 1;
-            q[33] = (byte)(Environment.TickCount & 0xFF);
+
+            q[33] =
+                (byte)(
+                    _touchCounter++ &
+                    0xFF);
+
+            // current packet:
+            // both fingers released
             q[34] = 0x80;
             q[38] = 0x80;
 
-            var err = Vigem.vigem_target_ds4_update_ex(client, target, r);
-            if (err != Vigem.Success)
-                throw new Exception($"ViGEm update failed: 0x{err:X8}");
+            // previous touch packet 1
+            q[42] = 0x80;
+            q[46] = 0x80;
 
-            if (Environment.TickCount64 - last > 1000)
+            // previous touch packet 2
+            q[51] = 0x80;
+            q[55] = 0x80;
+
+            // ============================
+            // SEND EXTENDED DS4 REPORT
+            // ============================
+
+            var err =
+                Vigem
+                .vigem_target_ds4_update_ex(
+                    client,
+                    target,
+                    r);
+
+            if (err != Vigem.Success)
+            {
+                throw new Exception(
+                    $"ViGEm update failed: 0x{err:X8}");
+            }
+
+            // ============================
+            // DEBUG OUTPUT
+            // ============================
+
+            if (
+                Environment.TickCount64 -
+                last >
+                1000)
             {
                 Console.WriteLine(
-                    $"DSU gyro {gx,8:F2} {gy,8:F2} {gz,8:F2} dps | " +
-                    $"RAW DS4 {rawGx,6} {rawGy,6} {rawGz,6} | ViGEm OK");
-                last = Environment.TickCount64;
+                    $"DSU gyro " +
+                    $"{gx,8:F2} " +
+                    $"{gy,8:F2} " +
+                    $"{gz,8:F2} dps | " +
+
+                    $"RAW DS4 " +
+                    $"{rawGx,6} " +
+                    $"{rawGy,6} " +
+                    $"{rawGz,6} | " +
+
+                    $"TS {_ds4Timestamp,5} | " +
+                    $"ViGEm OK");
+
+                last =
+                    Environment.TickCount64;
             }
         }
     }
 
-    static short ToI16(double x) =>
-        (short)Math.Clamp(Math.Round(x), short.MinValue, short.MaxValue);
-
-    void Send(uint type, byte[] payload)
+    static short ToI16(double x)
     {
-        byte[] p = new byte[20 + payload.Length];
-        p[0] = (byte)'D'; p[1] = (byte)'S'; p[2] = (byte)'U'; p[3] = (byte)'C';
-        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(4, 2), (ushort)Version);
-        BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(6, 2), (ushort)(4 + payload.Length));
-        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(8, 4), 0);
-        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(12, 4), id);
-        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(16, 4), type);
-        payload.CopyTo(p, 20);
-        BinaryPrimitives.WriteUInt32LittleEndian(p.AsSpan(8, 4), Crc32(p));
-        udp.Send(p, p.Length, portal);
+        return
+            (short)Math.Clamp(
+                Math.Round(x),
+                short.MinValue,
+                short.MaxValue);
+    }
+
+    void Send(
+        uint type,
+        byte[] payload)
+    {
+        byte[] p =
+            new byte[
+                20 +
+                payload.Length];
+
+        p[0] = (byte)'D';
+        p[1] = (byte)'S';
+        p[2] = (byte)'U';
+        p[3] = (byte)'C';
+
+        BinaryPrimitives
+            .WriteUInt16LittleEndian(
+                p.AsSpan(4, 2),
+                (ushort)Version);
+
+        BinaryPrimitives
+            .WriteUInt16LittleEndian(
+                p.AsSpan(6, 2),
+                (ushort)(
+                    4 +
+                    payload.Length));
+
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(8, 4),
+                0);
+
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(12, 4),
+                id);
+
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(16, 4),
+                type);
+
+        payload.CopyTo(
+            p,
+            20);
+
+        BinaryPrimitives
+            .WriteUInt32LittleEndian(
+                p.AsSpan(8, 4),
+                Crc32(p));
+
+        udp.Send(
+            p,
+            p.Length,
+            portal);
     }
 
     static uint Crc32(byte[] b)
     {
-        uint crc = 0xFFFFFFFF;
-        for (int i = 0; i < b.Length; i++)
+        uint crc =
+            0xFFFFFFFF;
+
+        for (
+            int i = 0;
+            i < b.Length;
+            i++)
         {
-            byte x = (i >= 8 && i < 12) ? (byte)0 : b[i];
+            byte x =
+                (i >= 8 &&
+                 i < 12)
+                ? (byte)0
+                : b[i];
+
             crc ^= x;
-            for (int j = 0; j < 8; j++)
-                crc = (crc >> 1) ^ (0xEDB88320u & (uint)-(int)(crc & 1));
+
+            for (
+                int j = 0;
+                j < 8;
+                j++)
+            {
+                crc =
+                    (crc >> 1) ^
+                    (
+                        0xEDB88320u &
+                        (uint)-(int)(
+                            crc & 1)
+                    );
+            }
         }
+
         return ~crc;
     }
 
     public void Dispose()
     {
-        try { if (target != IntPtr.Zero) Vigem.vigem_target_remove(client, target); } catch {}
-        try { if (target != IntPtr.Zero) Vigem.vigem_target_free(target); } catch {}
-        try { if (client != IntPtr.Zero) Vigem.vigem_disconnect(client); } catch {}
-        try { if (client != IntPtr.Zero) Vigem.vigem_free(client); } catch {}
+        try
+        {
+            if (target != IntPtr.Zero)
+                Vigem.vigem_target_remove(
+                    client,
+                    target);
+        }
+        catch { }
+
+        try
+        {
+            if (target != IntPtr.Zero)
+                Vigem.vigem_target_free(
+                    target);
+        }
+        catch { }
+
+        try
+        {
+            if (client != IntPtr.Zero)
+                Vigem.vigem_disconnect(
+                    client);
+        }
+        catch { }
+
+        try
+        {
+            if (client != IntPtr.Zero)
+                Vigem.vigem_free(
+                    client);
+        }
+        catch { }
+
         udp.Dispose();
     }
 }
 
 static class Program
 {
-    static void Main(string[] args)
+    static void Main(
+        string[] args)
     {
-        Console.WriteLine("Odin 2 Portal DSU -> Virtual DS4 bridge v3 RAW63");
+        Console.WriteLine(
+            "Odin 2 Portal DSU -> Virtual DS4 bridge v4 MOTION");
+
         Console.WriteLine();
 
-        string ip = args.Length > 0 ? args[0] : "";
-        if (string.IsNullOrWhiteSpace(ip))
+        string ip =
+            args.Length > 0
+            ? args[0]
+            : "";
+
+        if (
+            string.IsNullOrWhiteSpace(ip))
         {
-            Console.Write("Portal IP (e.g. 192.168.1.108): ");
-            ip = Console.ReadLine() ?? "";
+            Console.Write(
+                "Portal IP (e.g. 192.168.1.108): ");
+
+            ip =
+                Console.ReadLine() ??
+                "";
         }
 
         try
         {
-            using var b = new Bridge(ip.Trim());
+            using var b =
+                new Bridge(
+                    ip.Trim());
+
             b.Run();
         }
         catch (Exception ex)
         {
             Console.WriteLine();
-            Console.WriteLine("ERROR:");
-            Console.WriteLine(ex.Message);
+
+            Console.WriteLine(
+                "ERROR:");
+
+            Console.WriteLine(
+                ex.Message);
+
             Console.WriteLine();
-            Console.WriteLine("Press Enter to exit...");
+
+            Console.WriteLine(
+                "Press Enter to exit...");
+
             Console.ReadLine();
         }
     }
