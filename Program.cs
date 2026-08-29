@@ -20,6 +20,30 @@ internal static class Vigem
     [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern void vigem_disconnect(IntPtr client);
 
+    [DllImport("…
+[23:27, 29.08.2026] let the galaxy burn: using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+
+internal static class Vigem
+{
+    public const uint Success = 0x20000000;
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr vigem_alloc();
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void vigem_free(IntPtr client);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint vigem_connect(IntPtr client);
+
+    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void vigem_disconnect(IntPtr client);
+
     [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr vigem_target_ds4_alloc();
 
@@ -72,10 +96,19 @@ internal sealed class Bridge : IDisposable
     readonly uint id =
         (uint)Random.Shared.Next(1, int.MaxValue);
 
-    // DS4 motion state
-    ushort _ds4Timestamp = 0;
-    long _lastMotionTime = 0;
-    int _touchCounter = 0;
+    // ---------------------------------------------------------
+    // DEBUG
+    // ---------------------------------------------------------
+
+    byte[]? previousPacket = null;
+
+    long lastNormalPrint = 0;
+    long lastDebugPrint = 0;
+
+    int packetCounter = 0;
+
+    const int DebugStart = 20;
+    const int DebugEnd = 99;
 
     public Bridge(string ip)
     {
@@ -101,9 +134,7 @@ internal sealed class Bridge : IDisposable
             throw new Exception(
                 "vigem_target_ds4_alloc failed.");
 
-        e = Vigem.vigem_target_add(
-            client,
-            target);
+        e = Vigem.vigem_target_add(client, target);
 
         if (e != Vigem.Success)
             throw new Exception(
@@ -113,13 +144,35 @@ internal sealed class Bridge : IDisposable
     public void Run()
     {
         Console.WriteLine(
+            "Odin 2 Portal DSU -> Virtual DS4 bridge v5 DEBUG");
+
+        Console.WriteLine();
+
+        Console.WriteLine(
             $"Portal DSU: {portal.Address}:{Port}");
 
         Console.WriteLine(
             "Virtual DualShock 4: READY");
 
         Console.WriteLine(
-            "Waiting for AndroidDSU packets...");
+            "DEBUG MODE: watching DSU bytes 20..99");
+
+        Console.WriteLine();
+
+        Console.WriteLine(
+            "TEST:");
+
+        Console.WriteLine(
+            "1. Keep Odin completely still for ~5 seconds.");
+
+        Console.WriteLine(
+            "2. Then rotate Odin strongly LEFT/RIGHT.");
+
+        Console.WriteLine(
+            "3. Then tilt it UP/DOWN.");
+
+        Console.WriteLine(
+            "4. Photograph the CHANGED lines.");
 
         Console.WriteLine();
 
@@ -142,8 +195,6 @@ internal sealed class Bridge : IDisposable
             MsgPad,
             new byte[8]);
 
-        long last = 0;
-
         while (true)
         {
             IPEndPoint remote =
@@ -152,10 +203,13 @@ internal sealed class Bridge : IDisposable
             byte[] p =
                 udp.Receive(ref remote);
 
+            packetCounter++;
+
             if (p.Length < 100)
                 continue;
 
-            if (p[0] != 'D' ||
+            if (
+                p[0] != 'D' ||
                 p[1] != 'S' ||
                 p[2] != 'U' ||
                 p[3] != 'S')
@@ -163,34 +217,45 @@ internal sealed class Bridge : IDisposable
 
             uint type =
                 BinaryPrimitives
-                .ReadUInt32LittleEndian(
-                    p.AsSpan(16, 4));
+                    .ReadUInt32LittleEndian(
+                        p.AsSpan(16, 4));
 
             if (type != MsgPad)
                 continue;
 
-            // DSU packet layout
-            //
-            // 20 = slot
-            // 21 = connection state
-            //
-            // 36 = buttons 1
-            // 37 = buttons 2
-            // 38 = HOME
-            // 39 = touch
-            //
-            // 40..43 = sticks
-            //
-            // 76..87 = accelerometer
-            // 88..99 = gyro
-
             if (p[21] != 2)
                 continue;
+
+            // =================================================
+            // DEBUG: compare current packet with previous packet
+            // =================================================
+
+            if (previousPacket != null)
+            {
+                if (
+                    Environment.TickCount64 -
+                    lastDebugPrint > 250)
+                {
+                    PrintChangedBytes(
+                        previousPacket,
+                        p);
+
+                    lastDebugPrint =
+                        Environment.TickCount64;
+                }
+            }
+
+            previousPacket =
+                (byte[])p.Clone();
+
+            // =================================================
+            // EXISTING DSU INTERPRETATION
+            // =================================================
 
             byte b1 = p[36];
             byte b2 = p[37];
 
-            byte home  = p[38];
+            byte home = p[38];
             byte touch = p[39];
 
             byte lx = p[40];
@@ -216,23 +281,20 @@ internal sealed class Bridge : IDisposable
             float gz =
                 BitConverter.ToSingle(p, 96);
 
+            // =================================================
+            // CREATE VIRTUAL DS4 REPORT
+            // =================================================
+
             var r =
                 Vigem.DS4_REPORT_EX.Create();
 
-            byte[] q = r.Report;
-
-            // ============================
-            // STICKS
-            // ============================
+            byte[] q =
+                r.Report;
 
             q[0] = lx;
             q[1] = ly;
             q[2] = rx;
             q[3] = ry;
-
-            // ============================
-            // DPAD
-            // ============================
 
             bool left =
                 (b1 & 0x80) != 0;
@@ -272,10 +334,6 @@ internal sealed class Bridge : IDisposable
             else if (left)
                 d = 6;
 
-            // ============================
-            // BUTTONS
-            // ============================
-
             ushort buttons =
                 (ushort)d;
 
@@ -308,10 +366,6 @@ internal sealed class Bridge : IDisposable
                     q.AsSpan(4, 2),
                     buttons);
 
-            // ============================
-            // SPECIAL BUTTONS
-            // ============================
-
             byte special = 0;
 
             if ((b1 & 0x02) != 0)
@@ -334,55 +388,20 @@ internal sealed class Bridge : IDisposable
 
             q[6] = special;
 
-            // triggers
             q[7] = p[35];
             q[8] = p[34];
 
-            // ============================
-            // DS4 TIMESTAMP
-            // ============================
-
-            long nowTicks =
-                Environment.TickCount64;
-
-            if (_lastMotionTime == 0)
-                _lastMotionTime = nowTicks;
-
-            long elapsedMs =
-                nowTicks - _lastMotionTime;
-
-            _lastMotionTime =
-                nowTicks;
-
-            int increment =
-                (int)Math.Max(
-                    1,
-                    Math.Round(
-                        elapsedMs *
-                        (188.0 / 1.25)));
-
-            _ds4Timestamp =
-                unchecked(
-                    (ushort)(
-                        _ds4Timestamp +
-                        increment));
+            ushort ts =
+                (ushort)(
+                    Environment.TickCount &
+                    0xFFFF);
 
             BinaryPrimitives
                 .WriteUInt16LittleEndian(
                     q.AsSpan(9, 2),
-                    _ds4Timestamp);
+                    ts);
 
-            // ============================
-            // BATTERY
-            // ============================
-
-            q[11] = 0xFF;
-
-            // ============================
-            // GYRO
-            // AndroidDSU = degrees/sec
-            // DS4 = 16 units / degree/sec
-            // ============================
+            q[11] = 0x1B;
 
             short rawGx =
                 ToI16(gx * 16.0);
@@ -392,6 +411,15 @@ internal sealed class Bridge : IDisposable
 
             short rawGz =
                 ToI16(gz * 16.0);
+
+            short rawAx =
+                ToI16(ax * 8192.0);
+
+            short rawAy =
+                ToI16(ay * 8192.0);
+
+            short rawAz =
+                ToI16(az * 8192.0);
 
             BinaryPrimitives
                 .WriteInt16LittleEndian(
@@ -408,21 +436,6 @@ internal sealed class Bridge : IDisposable
                     q.AsSpan(16, 2),
                     rawGz);
 
-            // ============================
-            // ACCELEROMETER
-            // AndroidDSU = g
-            // DS4 ~= 8192 units / g
-            // ============================
-
-            short rawAx =
-                ToI16(ax * 8192.0);
-
-            short rawAy =
-                ToI16(ay * 8192.0);
-
-            short rawAz =
-                ToI16(az * 8192.0);
-
             BinaryPrimitives
                 .WriteInt16LittleEndian(
                     q.AsSpan(18, 2),
@@ -438,45 +451,18 @@ internal sealed class Bridge : IDisposable
                     q.AsSpan(22, 2),
                     rawAz);
 
-            // bytes 24..28 reserved
-
-            // ============================
-            // BATTERY / CONNECTION STATUS
-            // ============================
-
-            q[29] = 0x1A;
-
-            // ============================
-            // TOUCH PACKETS
-            // ============================
-
             q[32] = 1;
 
             q[33] =
                 (byte)(
-                    _touchCounter++ &
+                    Environment.TickCount &
                     0xFF);
 
-            // current packet:
-            // both fingers released
             q[34] = 0x80;
             q[38] = 0x80;
 
-            // previous touch packet 1
-            q[42] = 0x80;
-            q[46] = 0x80;
-
-            // previous touch packet 2
-            q[51] = 0x80;
-            q[55] = 0x80;
-
-            // ============================
-            // SEND EXTENDED DS4 REPORT
-            // ============================
-
             var err =
-                Vigem
-                .vigem_target_ds4_update_ex(
+                Vigem.vigem_target_ds4_update_ex(
                     client,
                     target,
                     r);
@@ -487,42 +473,105 @@ internal sealed class Bridge : IDisposable
                     $"ViGEm update failed: 0x{err:X8}");
             }
 
-            // ============================
-            // DEBUG OUTPUT
-            // ============================
+            // =================================================
+            // NORMAL STATUS
+            // =================================================
 
             if (
                 Environment.TickCount64 -
-                last >
-                1000)
+                lastNormalPrint > 1000)
             {
+                Console.WriteLine();
+
                 Console.WriteLine(
-                    $"DSU gyro " +
+                    $"GYRO@88: " +
                     $"{gx,8:F2} " +
                     $"{gy,8:F2} " +
                     $"{gz,8:F2} dps | " +
-
-                    $"RAW DS4 " +
-                    $"{rawGx,6} " +
+                    $"RAW {rawGx,6} " +
                     $"{rawGy,6} " +
                     $"{rawGz,6} | " +
+                    $"packet {packetCounter}");
 
-                    $"TS {_ds4Timestamp,5} | " +
-                    $"ViGEm OK");
-
-                last =
+                lastNormalPrint =
                     Environment.TickCount64;
             }
         }
     }
 
+    // =========================================================
+    // DEBUG FUNCTION
+    // =========================================================
+
+    static void PrintChangedBytes(
+        byte[] oldPacket,
+        byte[] newPacket)
+    {
+        int end =
+            Math.Min(
+                DebugEnd,
+                Math.Min(
+                    oldPacket.Length - 1,
+                    newPacket.Length - 1));
+
+        List<string> changed =
+            new();
+
+        for (
+            int i = DebugStart;
+            i <= end;
+            i++)
+        {
+            byte oldValue =
+                oldPacket[i];
+
+            byte newValue =
+                newPacket[i];
+
+            if (oldValue != newValue)
+            {
+                changed.Add(
+                    $"{i}:{oldValue:X2}>{newValue:X2}");
+            }
+        }
+
+        if (changed.Count == 0)
+        {
+            Console.WriteLine(
+                "CHANGED: none");
+        }
+        else
+        {
+            Console.WriteLine(
+                "CHANGED: " +
+                string.Join(
+                    "  ",
+                    changed));
+        }
+
+        // Also print suspected motion regions as raw hex
+
+        Console.Write(
+            "HEX 60-99: ");
+
+        for (
+            int i = 60;
+            i <= end;
+            i++)
+        {
+            Console.Write(
+                $"{newPacket[i]:X2} ");
+        }
+
+        Console.WriteLine();
+    }
+
     static short ToI16(double x)
     {
-        return
-            (short)Math.Clamp(
-                Math.Round(x),
-                short.MinValue,
-                short.MaxValue);
+        return (short)Math.Clamp(
+            Math.Round(x),
+            short.MinValue,
+            short.MaxValue);
     }
 
     void Send(
@@ -592,10 +641,9 @@ internal sealed class Bridge : IDisposable
             i++)
         {
             byte x =
-                (i >= 8 &&
-                 i < 12)
-                ? (byte)0
-                : b[i];
+                (i >= 8 && i < 12)
+                    ? (byte)0
+                    : b[i];
 
             crc ^= x;
 
@@ -608,8 +656,7 @@ internal sealed class Bridge : IDisposable
                     (crc >> 1) ^
                     (
                         0xEDB88320u &
-                        (uint)-(int)(
-                            crc & 1)
+                        (uint)-(int)(crc & 1)
                     );
             }
         }
@@ -658,18 +705,17 @@ internal sealed class Bridge : IDisposable
 
 static class Program
 {
-    static void Main(
-        string[] args)
+    static void Main(string[] args)
     {
         Console.WriteLine(
-            "Odin 2 Portal DSU -> Virtual DS4 bridge v4 MOTION");
+            "Odin 2 Portal DSU -> Virtual DS4 bridge v5 DEBUG");
 
         Console.WriteLine();
 
         string ip =
             args.Length > 0
-            ? args[0]
-            : "";
+                ? args[0]
+                : "";
 
         if (
             string.IsNullOrWhiteSpace(ip))
@@ -698,7 +744,7 @@ static class Program
                 "ERROR:");
 
             Console.WriteLine(
-                ex.Message);
+                ex.ToString());
 
             Console.WriteLine();
 
