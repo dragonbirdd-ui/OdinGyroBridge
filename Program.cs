@@ -2,54 +2,8 @@ using System;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 
-internal static class Vigem
-{
-    public const uint Success = 0x20000000;
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr vigem_alloc();
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void vigem_free(IntPtr client);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_connect(IntPtr client);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void vigem_disconnect(IntPtr client);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr vigem_target_ds4_alloc();
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void vigem_target_free(IntPtr target);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_target_add(IntPtr client, IntPtr target);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_target_remove(IntPtr client, IntPtr target);
-
-    [DllImport("ViGEmClient.dll", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint vigem_target_ds4_update_ex(
-        IntPtr client, IntPtr target, DS4_REPORT_EX report);
-
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    public struct DS4_REPORT_EX
-    {
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 63)]
-        public byte[] Report;
-
-        public static DS4_REPORT_EX Create()
-        {
-            return new DS4_REPORT_EX { Report = new byte[63] };
-        }
-    }
-}
-
-internal sealed class Bridge : IDisposable
+internal sealed class DsuScanner : IDisposable
 {
     const int Port = 26760;
     const uint Version = 1001;
@@ -59,51 +13,31 @@ internal sealed class Bridge : IDisposable
 
     readonly UdpClient udp = new UdpClient();
     readonly IPEndPoint portal;
-    readonly IntPtr client;
-    readonly IntPtr target;
     readonly uint id = (uint)Random.Shared.Next(1, int.MaxValue);
 
-    byte[] previousPacket = null;
+    long lastPrint = 0;
+    int packetCount = 0;
 
-    long lastStatus = 0;
-    long lastDebug = 0;
-
-    public Bridge(string ip)
+    public DsuScanner(string ip)
     {
         portal = new IPEndPoint(IPAddress.Parse(ip), Port);
-
-        client = Vigem.vigem_alloc();
-
-        if (client == IntPtr.Zero)
-            throw new Exception("ViGEmClient.dll: vigem_alloc failed.");
-
-        var e = Vigem.vigem_connect(client);
-
-        if (e != Vigem.Success)
-            throw new Exception("ViGEm connect failed: 0x" + e.ToString("X8"));
-
-        target = Vigem.vigem_target_ds4_alloc();
-
-        if (target == IntPtr.Zero)
-            throw new Exception("vigem_target_ds4_alloc failed.");
-
-        e = Vigem.vigem_target_add(client, target);
-
-        if (e != Vigem.Success)
-            throw new Exception("ViGEm target_add failed: 0x" + e.ToString("X8"));
     }
 
     public void Run()
     {
-        Console.WriteLine("Odin 2 Portal DSU -> Virtual DS4 bridge v5 DEBUG");
+        Console.WriteLine("Odin 2 Portal DSU v6 MOTION SCANNER");
         Console.WriteLine();
-        Console.WriteLine("Portal DSU: " + portal.Address + ":" + Port);
-        Console.WriteLine("Virtual DualShock 4: READY");
-        Console.WriteLine("Watching DSU bytes 20-99...");
+        Console.WriteLine("Portal: " + portal.Address + ":" + Port);
+        Console.WriteLine();
+        Console.WriteLine("This version scans offsets 60-99 as Float32.");
         Console.WriteLine();
         Console.WriteLine("TEST:");
-        Console.WriteLine("Keep Odin still for 5 seconds.");
-        Console.WriteLine("Then move/rotate Odin strongly.");
+        Console.WriteLine("1. Keep Odin still.");
+        Console.WriteLine("2. Rotate strongly LEFT/RIGHT.");
+        Console.WriteLine("3. Rotate strongly UP/DOWN.");
+        Console.WriteLine("4. Roll the device clockwise/counter-clockwise.");
+        Console.WriteLine();
+        Console.WriteLine("Take a photo while MOVING the Odin.");
         Console.WriteLine();
 
         Send(MsgVersion, new byte[] { 0xE9, 0x03 });
@@ -118,7 +52,10 @@ internal sealed class Bridge : IDisposable
             if (p.Length < 100)
                 continue;
 
-            if (p[0] != 'D' || p[1] != 'S' || p[2] != 'U' || p[3] != 'S')
+            if (p[0] != 'D' ||
+                p[1] != 'S' ||
+                p[2] != 'U' ||
+                p[3] != 'S')
                 continue;
 
             uint type = BinaryPrimitives.ReadUInt32LittleEndian(
@@ -130,203 +67,82 @@ internal sealed class Bridge : IDisposable
             if (p[21] != 2)
                 continue;
 
-            if (previousPacket != null &&
-                Environment.TickCount64 - lastDebug > 500)
+            packetCount++;
+
+            if (Environment.TickCount64 - lastPrint >= 500)
             {
-                PrintChangedBytes(previousPacket, p);
-                lastDebug = Environment.TickCount64;
-            }
-
-            previousPacket = (byte[])p.Clone();
-
-            byte b1 = p[36];
-            byte b2 = p[37];
-            byte home = p[38];
-            byte touch = p[39];
-
-            byte lx = p[40];
-            byte ly = p[41];
-            byte rx = p[42];
-            byte ry = p[43];
-
-            float ax = BitConverter.ToSingle(p, 76);
-            float ay = BitConverter.ToSingle(p, 80);
-            float az = BitConverter.ToSingle(p, 84);
-
-            float gx = BitConverter.ToSingle(p, 88);
-            float gy = BitConverter.ToSingle(p, 92);
-            float gz = BitConverter.ToSingle(p, 96);
-
-            var r = Vigem.DS4_REPORT_EX.Create();
-            byte[] q = r.Report;
-
-            q[0] = lx;
-            q[1] = ly;
-            q[2] = rx;
-            q[3] = ry;
-
-            bool left = (b1 & 0x80) != 0;
-            bool down = (b1 & 0x40) != 0;
-            bool right = (b1 & 0x20) != 0;
-            bool up = (b1 & 0x10) != 0;
-
-            int d = 8;
-
-            if (up && right)
-                d = 1;
-            else if (right && down)
-                d = 3;
-            else if (down && left)
-                d = 5;
-            else if (left && up)
-                d = 7;
-            else if (up)
-                d = 0;
-            else if (right)
-                d = 2;
-            else if (down)
-                d = 4;
-            else if (left)
-                d = 6;
-
-            ushort buttons = (ushort)d;
-
-            if ((b2 & 0x01) != 0) buttons |= 0x0080;
-            if ((b2 & 0x02) != 0) buttons |= 0x0040;
-            if ((b2 & 0x04) != 0) buttons |= 0x0020;
-            if ((b2 & 0x08) != 0) buttons |= 0x0010;
-            if ((b2 & 0x10) != 0) buttons |= 0x0200;
-            if ((b2 & 0x20) != 0) buttons |= 0x0100;
-            if ((b2 & 0x40) != 0) buttons |= 0x0800;
-            if ((b2 & 0x80) != 0) buttons |= 0x0400;
-
-            BinaryPrimitives.WriteUInt16LittleEndian(
-                q.AsSpan(4, 2), buttons);
-
-            byte special = 0;
-
-            if ((b1 & 0x02) != 0) special |= 0x02;
-            if ((b1 & 0x04) != 0) special |= 0x04;
-            if ((b1 & 0x01) != 0) special |= 0x10;
-            if ((b1 & 0x08) != 0) special |= 0x20;
-            if (home != 0) special |= 0x01;
-            if (touch != 0) special |= 0x08;
-
-            q[6] = special;
-            q[7] = p[35];
-            q[8] = p[34];
-
-            ushort ts = (ushort)(Environment.TickCount & 0xFFFF);
-
-            BinaryPrimitives.WriteUInt16LittleEndian(
-                q.AsSpan(9, 2), ts);
-
-            q[11] = 0x1B;
-
-            short rawGx = ToI16(gx * 16.0);
-            short rawGy = ToI16(gy * 16.0);
-            short rawGz = ToI16(gz * 16.0);
-
-            short rawAx = ToI16(ax * 8192.0);
-            short rawAy = ToI16(ay * 8192.0);
-            short rawAz = ToI16(az * 8192.0);
-
-            BinaryPrimitives.WriteInt16LittleEndian(
-                q.AsSpan(12, 2), rawGx);
-
-            BinaryPrimitives.WriteInt16LittleEndian(
-                q.AsSpan(14, 2), rawGy);
-
-            BinaryPrimitives.WriteInt16LittleEndian(
-                q.AsSpan(16, 2), rawGz);
-
-            BinaryPrimitives.WriteInt16LittleEndian(
-                q.AsSpan(18, 2), rawAx);
-
-            BinaryPrimitives.WriteInt16LittleEndian(
-                q.AsSpan(20, 2), rawAy);
-
-            BinaryPrimitives.WriteInt16LittleEndian(
-                q.AsSpan(22, 2), rawAz);
-
-            q[32] = 1;
-            q[33] = (byte)(Environment.TickCount & 0xFF);
-            q[34] = 0x80;
-            q[38] = 0x80;
-
-            var err = Vigem.vigem_target_ds4_update_ex(
-                client, target, r);
-
-            if (err != Vigem.Success)
-                throw new Exception(
-                    "ViGEm update failed: 0x" + err.ToString("X8"));
-
-            if (Environment.TickCount64 - lastStatus > 1000)
-            {
-                Console.WriteLine(
-                    "GYRO@88 " +
-                    gx.ToString("F2") + " " +
-                    gy.ToString("F2") + " " +
-                    gz.ToString("F2") +
-                    " | RAW " +
-                    rawGx + " " +
-                    rawGy + " " +
-                    rawGz +
-                    " | ViGEm OK");
-
-                lastStatus = Environment.TickCount64;
+                PrintPacket(p);
+                lastPrint = Environment.TickCount64;
             }
         }
     }
 
-    static void PrintChangedBytes(byte[] oldPacket, byte[] newPacket)
+    static void PrintPacket(byte[] p)
     {
-        int end = Math.Min(
-            99,
-            Math.Min(oldPacket.Length - 1, newPacket.Length - 1));
-
-        Console.Write("CHANGED: ");
-
-        bool any = false;
-
-        for (int i = 20; i <= end; i++)
-        {
-            if (oldPacket[i] != newPacket[i])
-            {
-                Console.Write(
-                    i +
-                    ":" +
-                    oldPacket[i].ToString("X2") +
-                    ">" +
-                    newPacket[i].ToString("X2") +
-                    " ");
-
-                any = true;
-            }
-        }
-
-        if (!any)
-            Console.Write("NONE");
+        Console.WriteLine();
+        Console.WriteLine("============================================================");
+        Console.WriteLine("MOTION SCAN");
 
         Console.WriteLine();
+        Console.WriteLine("HEX 60-99:");
 
-        Console.Write("HEX60-99: ");
-
-        for (int i = 60; i <= end; i++)
+        for (int i = 60; i <= 99; i++)
         {
-            Console.Write(newPacket[i].ToString("X2"));
-            Console.Write(" ");
+            Console.Write(p[i].ToString("X2") + " ");
         }
 
         Console.WriteLine();
+        Console.WriteLine();
+
+        Console.WriteLine("ALIGNED FLOAT32:");
+
+        PrintFloat(p, 60);
+        PrintFloat(p, 64);
+        PrintFloat(p, 68);
+        PrintFloat(p, 72);
+        PrintFloat(p, 76);
+        PrintFloat(p, 80);
+        PrintFloat(p, 84);
+        PrintFloat(p, 88);
+        PrintFloat(p, 92);
+        PrintFloat(p, 96);
+
+        Console.WriteLine();
+        Console.WriteLine("ALL CANDIDATE OFFSETS 60-96:");
+
+        for (int offset = 60; offset <= 96; offset++)
+        {
+            float value = BitConverter.ToSingle(p, offset);
+
+            if (float.IsNaN(value) || float.IsInfinity(value))
+                continue;
+
+            if (Math.Abs(value) > 1000000.0f)
+                continue;
+
+            Console.Write(
+                offset.ToString("D2") +
+                "=" +
+                value.ToString("0.000") +
+                "  ");
+
+            if ((offset - 59) % 4 == 0)
+                Console.WriteLine();
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("============================================================");
     }
 
-    static short ToI16(double x)
+    static void PrintFloat(byte[] p, int offset)
     {
-        return (short)Math.Clamp(
-            Math.Round(x),
-            short.MinValue,
-            short.MaxValue);
+        float value = BitConverter.ToSingle(p, offset);
+
+        Console.WriteLine(
+            "OFFSET " +
+            offset.ToString("D2") +
+            " = " +
+            value.ToString("0.000000"));
     }
 
     void Send(uint type, byte[] payload)
@@ -394,34 +210,6 @@ internal sealed class Bridge : IDisposable
 
     public void Dispose()
     {
-        try
-        {
-            if (target != IntPtr.Zero)
-                Vigem.vigem_target_remove(client, target);
-        }
-        catch { }
-
-        try
-        {
-            if (target != IntPtr.Zero)
-                Vigem.vigem_target_free(target);
-        }
-        catch { }
-
-        try
-        {
-            if (client != IntPtr.Zero)
-                Vigem.vigem_disconnect(client);
-        }
-        catch { }
-
-        try
-        {
-            if (client != IntPtr.Zero)
-                Vigem.vigem_free(client);
-        }
-        catch { }
-
         udp.Dispose();
     }
 }
@@ -430,28 +218,21 @@ static class Program
 {
     static void Main(string[] args)
     {
-        Console.WriteLine(
-            "Odin 2 Portal DSU -> Virtual DS4 bridge v5 DEBUG");
-
+        Console.WriteLine("Odin 2 Portal DSU v6 MOTION SCANNER");
         Console.WriteLine();
 
-        string ip =
-            args.Length > 0
-            ? args[0]
-            : "";
+        string ip = args.Length > 0 ? args[0] : "";
 
         if (string.IsNullOrWhiteSpace(ip))
         {
-            Console.Write(
-                "Portal IP (e.g. 192.168.1.108): ");
-
+            Console.Write("Portal IP (e.g. 192.168.1.108): ");
             ip = Console.ReadLine() ?? "";
         }
 
         try
         {
-            using var b = new Bridge(ip.Trim());
-            b.Run();
+            using var scanner = new DsuScanner(ip.Trim());
+            scanner.Run();
         }
         catch (Exception ex)
         {
